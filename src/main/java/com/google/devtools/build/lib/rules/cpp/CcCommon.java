@@ -206,13 +206,7 @@ public final class CcCommon {
    */
   public ImmutableList<String> getLinkopts() {
     Preconditions.checkState(hasAttribute("linkopts", Type.STRING_LIST));
-    Iterable<String> ourLinkopts = ruleContext.attributes().get("linkopts", Type.STRING_LIST);
-    List<String> result;
-    if (ourLinkopts != null) {
-      result = CppHelper.expandLinkopts(ruleContext, "linkopts", ourLinkopts);
-    } else {
-      result = ImmutableList.of();
-    }
+    ImmutableList<String> result = CppHelper.getLinkopts(ruleContext);
 
     if (ApplePlatform.isApplePlatform(ccToolchain.getTargetCpu()) && result.contains("-static")) {
       ruleContext.attributeError(
@@ -912,20 +906,27 @@ public final class CcCommon {
     }
 
     FdoContext.BranchFdoProfile branchFdoProvider = toolchain.getFdoContext().getBranchFdoProfile();
+
+    boolean enablePropellerOptimize =
+        (cppConfiguration.getPropellerOptimizeLabel() != null
+            || cppConfiguration.getPropellerOptimizeAbsoluteCCProfile() != null
+            || cppConfiguration.getPropellerOptimizeAbsoluteLdProfile() != null);
+
     if (branchFdoProvider != null && cppConfiguration.getCompilationMode() == CompilationMode.OPT) {
       if ((branchFdoProvider.isLlvmFdo() || branchFdoProvider.isLlvmCSFdo())
           && !allUnsupportedFeatures.contains(CppRuleClasses.FDO_OPTIMIZE)) {
         allFeatures.add(CppRuleClasses.FDO_OPTIMIZE);
-        // For LLVM, support implicit enabling of ThinLTO for FDO unless it has been
-        // explicitly disabled.
-        if (toolchain.isLLVMCompiler()
-            && !allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
+        // Support implicit enabling of ThinLTO for FDO unless it has been explicitly disabled.
+        if (!allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
           allFeatures.add(CppRuleClasses.ENABLE_FDO_THINLTO);
         }
 
-        // Support implicit enabling of split functions for FDO unless it has been disabled.
-        if (toolchain.isLLVMCompiler()
-            && !allUnsupportedFeatures.contains(CppRuleClasses.SPLIT_FUNCTIONS)) {
+        // Support implicit enabling of split functions for FDO unless it has been explicitly
+        // disabled
+        // or propeller_optimize is used. propeller_optimize must also disable split functions as
+        // they are mutually exclusive.
+        if (!allUnsupportedFeatures.contains(CppRuleClasses.SPLIT_FUNCTIONS)
+            && !enablePropellerOptimize) {
           allFeatures.add(CppRuleClasses.ENABLE_FDO_SPLIT_FUNCTIONS);
         }
       }
@@ -934,19 +935,15 @@ public final class CcCommon {
       }
       if (branchFdoProvider.isAutoFdo()) {
         allFeatures.add(CppRuleClasses.AUTOFDO);
-        // For LLVM, support implicit enabling of ThinLTO for AFDO unless it has been
-        // explicitly disabled.
-        if (toolchain.isLLVMCompiler()
-            && !allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
+        // Support implicit enabling of ThinLTO for AFDO unless it has been disabled.
+        if (!allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
           allFeatures.add(CppRuleClasses.ENABLE_AFDO_THINLTO);
         }
       }
       if (branchFdoProvider.isAutoXBinaryFdo()) {
         allFeatures.add(CppRuleClasses.XBINARYFDO);
-        // For LLVM, support implicit enabling of ThinLTO for XFDO unless it has been
-        // explicitly disabled.
-        if (toolchain.isLLVMCompiler()
-            && !allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
+        // Support implicit enabling of ThinLTO for XFDO unless it has been explicitly disabled.
+        if (!allUnsupportedFeatures.contains(CppRuleClasses.THIN_LTO)) {
           allFeatures.add(CppRuleClasses.ENABLE_XFDO_THINLTO);
         }
       }
@@ -955,9 +952,7 @@ public final class CcCommon {
       allRequestedFeaturesBuilder.add(CppRuleClasses.FDO_PREFETCH_HINTS);
     }
 
-    if (cppConfiguration.getPropellerOptimizeLabel() != null
-        || cppConfiguration.getPropellerOptimizeAbsoluteCCProfile() != null
-        || cppConfiguration.getPropellerOptimizeAbsoluteLdProfile() != null) {
+    if (enablePropellerOptimize) {
       allRequestedFeaturesBuilder.add(CppRuleClasses.PROPELLER_OPTIMIZE);
     }
 
@@ -1119,6 +1114,10 @@ public final class CcCommon {
 
     RuleClass ruleClass = rule.getRuleClassObject();
     Label label = ruleClass.getRuleDefinitionEnvironmentLabel();
+    if (label.getRepository().getName().equals("@_builtins")) {
+      // always permit builtins
+      return true;
+    }
     if (label != null) {
       return whitelistedPackages.stream()
           .anyMatch(path -> label.getPackageFragment().toString().startsWith(path));

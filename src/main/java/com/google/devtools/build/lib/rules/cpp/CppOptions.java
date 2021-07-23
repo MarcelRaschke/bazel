@@ -949,6 +949,20 @@ public class CppOptions extends FragmentOptions {
   public boolean disableNoCopts;
 
   @Option(
+      name = "incompatible_enable_cc_test_feature",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {OptionEffectTag.ACTION_COMMAND_LINES},
+      metadataTags = {
+        OptionMetadataTag.INCOMPATIBLE_CHANGE,
+        OptionMetadataTag.TRIGGERED_BY_ALL_INCOMPATIBLE_CHANGES,
+      },
+      help =
+          "When enabled, it switches Crosstool to use feature 'is_cc_test' rather than"
+              + " the link-time build variable of the same name.")
+  public boolean enableCcTestFeature;
+
+  @Option(
       name = "incompatible_load_cc_rules_from_bzl",
       defaultValue = "false",
       documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
@@ -1065,6 +1079,17 @@ public class CppOptions extends FragmentOptions {
           "If set, .d files emitted by clang will be used to prune the set of inputs passed into "
               + "objc compiles.")
   public boolean objcGenerateDotdFiles;
+
+  @Option(
+      name = "experimental_cc_implementation_deps",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {
+        OptionEffectTag.LOADING_AND_ANALYSIS,
+      },
+      metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+      help = "If enabled, cc_library targets can use attribute `implementation_deps`.")
+  public boolean experimentalCcImplementationDeps;
 
   /** See {@link #targetLibcTopLabel} documentation. * */
   @Override

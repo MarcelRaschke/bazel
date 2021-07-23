@@ -540,14 +540,10 @@ public class StarlarkActionFactory implements StarlarkActionFactoryApi {
       Object shadowedActionUnchecked,
       StarlarkAction.Builder builder)
       throws EvalException {
-    Iterable<Artifact> inputArtifacts;
     if (inputs instanceof Sequence) {
-      inputArtifacts = Sequence.cast(inputs, Artifact.class, "inputs");
-      builder.addInputs(inputArtifacts);
+      builder.addInputs(Sequence.cast(inputs, Artifact.class, "inputs"));
     } else {
-      NestedSet<Artifact> inputSet = Depset.cast(inputs, Artifact.class, "inputs");
-      builder.addTransitiveInputs(inputSet);
-      inputArtifacts = inputSet.toList();
+      builder.addTransitiveInputs(Depset.cast(inputs, Artifact.class, "inputs"));
     }
 
     List<Artifact> outputArtifacts = Sequence.cast(outputs, Artifact.class, "outputs");
@@ -603,7 +599,7 @@ public class StarlarkActionFactory implements StarlarkActionFactoryApi {
           ImmutableMap.copyOf(Dict.cast(envUnchecked, String.class, String.class, "env")));
     }
     if (progressMessage != Starlark.NONE) {
-      builder.setProgressMessageNonLazy((String) progressMessage);
+      builder.setProgressMessageFromStarlark((String) progressMessage);
     }
     if (Starlark.truth(useDefaultShellEnv)) {
       builder.useDefaultShellEnvironment();

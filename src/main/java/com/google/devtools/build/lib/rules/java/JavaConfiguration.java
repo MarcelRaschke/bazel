@@ -105,7 +105,8 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
   private final boolean disallowResourceJars;
   private final boolean disallowLegacyJavaToolchainFlags;
   private final boolean experimentalTurbineAnnotationProcessing;
-  private final boolean experimentalPublishJavaCcLinkParamsInfo;
+  private final boolean experimentalEnableJspecify;
+  private final boolean requireJavaPluginInfo;
 
   // TODO(dmarting): remove once we have a proper solution for #2539
   private final boolean useLegacyBazelJavaTest;
@@ -143,6 +144,7 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     this.addTestSupportToCompileTimeDeps = javaOptions.addTestSupportToCompileTimeDeps;
     this.runAndroidLint = javaOptions.runAndroidLint;
     this.limitAndroidLintToAndroidCompatible = javaOptions.limitAndroidLintToAndroidCompatible;
+    this.requireJavaPluginInfo = javaOptions.requireJavaPluginInfo;
 
     Map<String, Label> optimizers = javaOptions.bytecodeOptimizers;
     if (optimizers.size() > 1) {
@@ -164,8 +166,7 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     this.disallowLegacyJavaToolchainFlags = javaOptions.disallowLegacyJavaToolchainFlags;
     this.experimentalTurbineAnnotationProcessing =
         javaOptions.experimentalTurbineAnnotationProcessing;
-    this.experimentalPublishJavaCcLinkParamsInfo =
-        javaOptions.experimentalPublishJavaCcLinkParamsInfo;
+    this.experimentalEnableJspecify = javaOptions.experimentalEnableJspecify;
 
     if (javaOptions.disallowLegacyJavaToolchainFlags) {
       checkLegacyToolchainFlagIsUnset(
@@ -223,6 +224,7 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     return inmemoryJdepsFiles;
   }
 
+  @Override
   public ImmutableList<String> getDefaultJvmFlags() {
     return defaultJvmFlags;
   }
@@ -248,6 +250,11 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
   }
 
   /** @return proper label only if --java_launcher= is specified, otherwise null. */
+  @StarlarkConfigurationField(
+      name = "launcher",
+      doc = "Returns the label provided with --java_launcher, if any.",
+      defaultInToolRepository = true)
+  @Nullable
   public Label getJavaLauncherLabel() {
     return javaLauncherLabel;
   }
@@ -342,6 +349,11 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     return enforceOneVersion;
   }
 
+  @Override
+  public String starlarkOneVersionEnforcementLevel() {
+    return oneVersionEnforcementLevel().name();
+  }
+
   public boolean enforceOneVersionOnJavaTests() {
     return enforceOneVersionOnJavaTests;
   }
@@ -391,7 +403,11 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     return experimentalTurbineAnnotationProcessing;
   }
 
-  public boolean experimentalPublishJavaCcLinkParamsInfo() {
-    return experimentalPublishJavaCcLinkParamsInfo;
+  public boolean experimentalEnableJspecify() {
+    return experimentalEnableJspecify;
+  }
+
+  public boolean requireJavaPluginInfo() {
+    return requireJavaPluginInfo;
   }
 }

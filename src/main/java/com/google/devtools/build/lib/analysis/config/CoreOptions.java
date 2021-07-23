@@ -379,21 +379,13 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
   public boolean collectCodeCoverage;
 
   @Option(
-      name = "experimental_forward_instrumented_files_info_by_default",
-      defaultValue = "false",
-      documentationCategory = OptionDocumentationCategory.OUTPUT_PARAMETERS,
-      effectTags = {OptionEffectTag.AFFECTS_OUTPUTS},
-      help =
-          "If specified, rules that don't configure InstrumentedFilesInfo will still forward the "
-              + "contents of InstrumentedFilesInfo from transitive dependencies.")
-  public boolean experimentalForwardInstrumentedFilesInfoByDefault;
-
-  @Option(
       name = "build_runfile_manifests",
       defaultValue = "true",
       documentationCategory = OptionDocumentationCategory.OUTPUT_SELECTION,
       effectTags = {OptionEffectTag.AFFECTS_OUTPUTS},
-      help = "If true, write runfiles manifests for all targets.  " + "If false, omit them.")
+      help =
+          "If true, write runfiles manifests for all targets. If false, omit them. Local tests will"
+              + " fail to run when false.")
   public boolean buildRunfilesManifests;
 
   @Option(
@@ -563,7 +555,7 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
 
   @Option(
       name = "analysis_testing_deps_limit",
-      defaultValue = "600",
+      defaultValue = "800",
       documentationCategory = OptionDocumentationCategory.TESTING,
       effectTags = {OptionEffectTag.LOADING_AND_ANALYSIS},
       help =
@@ -610,41 +602,6 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
           "Declare the environment_group to use for automatically mapping cpu values to "
               + "target_environment values.")
   public Label autoCpuEnvironmentGroup;
-
-  /** Values for --experimental_dynamic_configs. */
-  public enum ConfigsMode {
-    /**
-     * Deprecated mode: Each configured target is evaluated with only the configuration fragments it
-     * needs by loading the target graph and examining the transitive requirements for each target
-     * before analysis begins.
-     *
-     * <p>To become a no-op soon: b/129289764
-     */
-    ON,
-    /** Default mode: Each configured target is evaluated with all fragments known to Blaze. */
-    NOTRIM
-  }
-
-  /** Converter for --experimental_dynamic_configs. */
-  public static class ConfigsModeConverter extends EnumConverter<ConfigsMode> {
-    public ConfigsModeConverter() {
-      super(ConfigsMode.class, "configurations mode");
-    }
-  }
-
-  @Option(
-      name = "experimental_dynamic_configs",
-      defaultValue = "notrim",
-      converter = ConfigsModeConverter.class,
-      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
-      effectTags = {
-        OptionEffectTag.LOSES_INCREMENTAL_STATE,
-        OptionEffectTag.BAZEL_INTERNAL_CONFIGURATION,
-        OptionEffectTag.LOADING_AND_ANALYSIS,
-      },
-      metadataTags = {OptionMetadataTag.EXPERIMENTAL},
-      help = "Instantiates build configurations with the specified properties")
-  public ConfigsMode configsMode;
 
   /** Values for --experimental_output_paths. */
   public enum OutputPathsMode {
@@ -840,15 +797,6 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
   public boolean remotableSourceManifestActions;
 
   @Option(
-      name = "experimental_enable_aggregating_middleman",
-      defaultValue = "true",
-      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
-      effectTags = {OptionEffectTag.LOADING_AND_ANALYSIS},
-      metadataTags = {OptionMetadataTag.EXPERIMENTAL},
-      help = "Whether to enable the use of AggregatingMiddleman in rules.")
-  public boolean enableAggregatingMiddleman;
-
-  @Option(
       name = "flag_alias",
       converter = Converters.FlagAliasConverter.class,
       defaultValue = "null",
@@ -859,6 +807,18 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
           "Sets a shorthand name for a Starlark flag. It takes a single key-value pair in the form"
               + " \"<key>=<value>\" as an argument.")
   public List<Map.Entry<String, String>> commandLineFlagAliases;
+
+  @Option(
+      name = "archived_tree_artifact_mnemonics_filter",
+      defaultValue = "-.*", // disabled by default
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {OptionEffectTag.LOADING_AND_ANALYSIS, OptionEffectTag.EXECUTION},
+      converter = RegexFilter.RegexFilterConverter.class,
+      help =
+          "Regex filter for mnemonics of actions for which we should create archived tree"
+              + " artifacts. This option is a no-op for actions which do not generate tree"
+              + " artifacts.")
+  public RegexFilter archivedArtifactsMnemonicsFilter;
 
   /** Ways configured targets may provide the {@link Fragment}s they require. */
   public enum IncludeConfigFragmentsEnum {
@@ -875,7 +835,7 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
     /** Provide the fragments required <em>directly</em> by this rule. */
     DIRECT,
     /** Provide the fragments required by this rule and its transitive dependencies. */
-    TRANSITIVE;
+    TRANSITIVE
   }
 
   /** Enum converter for --include_config_fragments_provider. */
@@ -896,7 +856,6 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
     host.compilationMode = hostCompilationMode;
     host.isHost = true;
     host.isExec = false;
-    host.configsMode = configsMode;
     host.outputPathsMode = outputPathsMode;
     host.enableRunfiles = enableRunfiles;
     host.executionInfoModifier = executionInfoModifier;
@@ -905,7 +864,6 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
     host.mergeGenfilesDirectory = mergeGenfilesDirectory;
     host.cpu = hostCpu;
     host.includeRequiredConfigFragmentsProvider = includeRequiredConfigFragmentsProvider;
-    host.enableAggregatingMiddleman = enableAggregatingMiddleman;
 
     // === Runfiles ===
     host.buildRunfilesManifests = buildRunfilesManifests;
@@ -939,6 +897,9 @@ public class CoreOptions extends FragmentOptions implements Cloneable {
     // Pass host action environment variables
     host.actionEnvironment = hostActionEnvironment;
     host.hostActionEnvironment = hostActionEnvironment;
+
+    // Pass archived tree artifacts filter.
+    host.archivedArtifactsMnemonicsFilter = archivedArtifactsMnemonicsFilter;
 
     return host;
   }

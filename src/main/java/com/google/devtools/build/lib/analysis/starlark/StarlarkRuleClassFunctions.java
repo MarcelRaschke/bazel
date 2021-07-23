@@ -15,6 +15,7 @@
 package com.google.devtools.build.lib.analysis.starlark;
 
 import static com.google.devtools.build.lib.analysis.BaseRuleClasses.RUN_UNDER;
+import static com.google.devtools.build.lib.analysis.BaseRuleClasses.TIMEOUT_DEFAULT;
 import static com.google.devtools.build.lib.analysis.BaseRuleClasses.getTestRuntimeLabelList;
 import static com.google.devtools.build.lib.packages.Attribute.attr;
 import static com.google.devtools.build.lib.packages.BuildType.LABEL;
@@ -25,20 +26,22 @@ import static com.google.devtools.build.lib.packages.Type.INTEGER;
 import static com.google.devtools.build.lib.packages.Type.STRING;
 import static com.google.devtools.build.lib.packages.Type.STRING_LIST;
 
+import com.github.benmanes.caffeine.cache.CacheLoader;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.base.Preconditions;
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.analysis.BaseRuleClasses;
-import com.google.devtools.build.lib.analysis.RuleDefinitionContext;
+import com.google.devtools.build.lib.analysis.RuleDefinitionEnvironment;
 import com.google.devtools.build.lib.analysis.TemplateVariableInfo;
 import com.google.devtools.build.lib.analysis.config.ConfigAwareRuleClassBuilder;
 import com.google.devtools.build.lib.analysis.config.HostTransition;
 import com.google.devtools.build.lib.analysis.config.StarlarkDefinedConfigTransition;
+import com.google.devtools.build.lib.analysis.config.transitions.PatchTransition;
+import com.google.devtools.build.lib.analysis.config.transitions.TransitionFactory;
 import com.google.devtools.build.lib.analysis.platform.ConstraintValueInfo;
 import com.google.devtools.build.lib.analysis.starlark.StarlarkAttrModule.Descriptor;
 import com.google.devtools.build.lib.analysis.test.TestConfiguration;
@@ -48,9 +51,9 @@ import com.google.devtools.build.lib.cmdline.LabelValidator;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
+import com.google.devtools.build.lib.packages.AllowlistChecker;
 import com.google.devtools.build.lib.packages.Attribute;
 import com.google.devtools.build.lib.packages.Attribute.StarlarkComputedDefaultTemplate;
-import com.google.devtools.build.lib.packages.AttributeMap;
 import com.google.devtools.build.lib.packages.AttributeValueSource;
 import com.google.devtools.build.lib.packages.BazelModuleContext;
 import com.google.devtools.build.lib.packages.BazelStarlarkContext;
@@ -66,6 +69,7 @@ import com.google.devtools.build.lib.packages.Package.NameConflictException;
 import com.google.devtools.build.lib.packages.PackageFactory.PackageContext;
 import com.google.devtools.build.lib.packages.PredicateWithMessage;
 import com.google.devtools.build.lib.packages.Provider;
+import com.google.devtools.build.lib.packages.Rule;
 import com.google.devtools.build.lib.packages.RuleClass;
 import com.google.devtools.build.lib.packages.RuleClass.Builder.RuleClassType;
 import com.google.devtools.build.lib.packages.RuleClass.ToolchainTransitionMode;
@@ -80,17 +84,16 @@ import com.google.devtools.build.lib.packages.StarlarkExportable;
 import com.google.devtools.build.lib.packages.StarlarkProvider;
 import com.google.devtools.build.lib.packages.StarlarkProviderIdentifier;
 import com.google.devtools.build.lib.packages.TargetUtils;
-import com.google.devtools.build.lib.packages.TestSize;
 import com.google.devtools.build.lib.packages.Type;
 import com.google.devtools.build.lib.packages.Type.ConversionException;
-import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
+import com.google.devtools.build.lib.skyframe.serialization.autocodec.SerializationConstant;
 import com.google.devtools.build.lib.starlarkbuildapi.StarlarkRuleFunctionsApi;
+import com.google.devtools.build.lib.util.FileType;
 import com.google.devtools.build.lib.util.FileTypeSet;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.errorprone.annotations.FormatMethod;
 import java.util.Collection;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
 import javax.annotation.Nullable;
 import net.starlark.java.eval.Debug;
 import net.starlark.java.eval.Dict;
@@ -109,13 +112,12 @@ import net.starlark.java.syntax.Location;
 
 /** A helper class to provide an easier API for Starlark rule definitions. */
 public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Artifact> {
-
   // TODO(bazel-team): Copied from ConfiguredRuleClassProvider for the transition from built-in
   // rules to Starlark extensions. Using the same instance would require a large refactoring.
   // If we don't want to support old built-in rules and Starlark simultaneously
   // (except for transition phase) it's probably OK.
   private static final LoadingCache<String, Label> labelCache =
-      CacheBuilder.newBuilder()
+      Caffeine.newBuilder()
           .build(
               new CacheLoader<String, Label>() {
                 @Override
@@ -143,16 +145,22 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
                   .allowedFileTypes(FileTypeSet.NO_FILE)
                   .mandatoryProviders(ImmutableList.of(TemplateVariableInfo.PROVIDER.id()))
                   .dontCheckConstraints())
-          .add(attr(RuleClass.EXEC_PROPERTIES, Type.STRING_DICT).value(ImmutableMap.of()))
+          .add(attr(RuleClass.EXEC_PROPERTIES_ATTR, Type.STRING_DICT).value(ImmutableMap.of()))
           .add(
               attr(RuleClass.EXEC_COMPATIBLE_WITH_ATTR, BuildType.LABEL_LIST)
                   .allowedFileTypes()
                   .nonconfigurable("Used in toolchain resolution")
+                  .tool(
+                      "exec_compatible_with exists for constraint checking, not to create an"
+                          + " actual dependency")
                   .value(ImmutableList.of()))
           .add(
-              attr(RuleClass.TARGET_RESTRICTED_TO_ATTR, LABEL_LIST)
+              attr(RuleClass.TARGET_COMPATIBLE_WITH_ATTR, LABEL_LIST)
                   .mandatoryProviders(ConstraintValueInfo.PROVIDER.id())
                   // This should be configurable to allow for complex types of restrictions.
+                  .tool(
+                      "target_compatible_with exists for constraint checking, not to create an"
+                          + " actual dependency")
                   .allowedFileTypes(FileTypeSet.NO_FILE))
           .build();
 
@@ -164,7 +172,7 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
           .build();
 
   /** Parent rule class for test Starlark rules. */
-  public static final RuleClass getTestBaseRule(RuleDefinitionContext env) {
+  public static final RuleClass getTestBaseRule(RuleDefinitionEnvironment env) {
     String toolsRepository = env.getToolsRepository();
     return new RuleClass.Builder("$test_base_rule", RuleClassType.ABSTRACT, true, baseRule)
         .requiresConfigurationFragments(TestConfiguration.class)
@@ -179,8 +187,8 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
         .add(
             attr("timeout", STRING)
                 .taggable()
-                .nonconfigurable("used in loading phase rule validation logic")
-                .value(timeoutAttribute))
+                .nonconfigurable("policy decision: should be consistent across configurations")
+                .value(TIMEOUT_DEFAULT))
         .add(
             attr("flaky", BOOLEAN)
                 .value(false)
@@ -199,12 +207,12 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
             attr("$test_wrapper", LABEL)
                 .cfg(HostTransition.createFactory())
                 .singleArtifact()
-                .value(labelCache.getUnchecked(toolsRepository + "//tools/test:test_wrapper")))
+                .value(labelCache.get(toolsRepository + "//tools/test:test_wrapper")))
         .add(
             attr("$xml_writer", LABEL)
                 .cfg(HostTransition.createFactory())
                 .singleArtifact()
-                .value(labelCache.getUnchecked(toolsRepository + "//tools/test:xml_writer")))
+                .value(labelCache.get(toolsRepository + "//tools/test:xml_writer")))
         .add(
             attr("$test_runtime", LABEL_LIST)
                 .cfg(HostTransition.createFactory())
@@ -215,25 +223,24 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
             attr("$test_setup_script", LABEL)
                 .cfg(HostTransition.createFactory())
                 .singleArtifact()
-                .value(labelCache.getUnchecked(toolsRepository + "//tools/test:test_setup")))
+                .value(labelCache.get(toolsRepository + "//tools/test:test_setup")))
         .add(
             attr("$xml_generator_script", LABEL)
                 .cfg(HostTransition.createFactory())
                 .singleArtifact()
-                .value(
-                    labelCache.getUnchecked(toolsRepository + "//tools/test:test_xml_generator")))
+                .value(labelCache.get(toolsRepository + "//tools/test:test_xml_generator")))
         .add(
             attr("$collect_coverage_script", LABEL)
                 .cfg(HostTransition.createFactory())
                 .singleArtifact()
-                .value(labelCache.getUnchecked(toolsRepository + "//tools/test:collect_coverage")))
+                .value(labelCache.get(toolsRepository + "//tools/test:collect_coverage")))
         // Input files for test actions collecting code coverage
         .add(
             attr(":coverage_support", LABEL)
                 .cfg(HostTransition.createFactory())
                 .value(
                     BaseRuleClasses.coverageSupportAttribute(
-                        labelCache.getUnchecked(
+                        labelCache.get(
                             toolsRepository + BaseRuleClasses.DEFAULT_COVERAGE_SUPPORT_VALUE))))
         // Used in the one-per-build coverage report generation action.
         .add(
@@ -241,28 +248,12 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
                 .cfg(HostTransition.createFactory())
                 .value(
                     BaseRuleClasses.coverageReportGeneratorAttribute(
-                        labelCache.getUnchecked(
+                        labelCache.get(
                             toolsRepository
                                 + BaseRuleClasses.DEFAULT_COVERAGE_REPORT_GENERATOR_VALUE))))
         .add(attr(":run_under", LABEL).value(RUN_UNDER))
         .build();
   }
-
-  @AutoCodec @AutoCodec.VisibleForSerialization
-  static final Attribute.ComputedDefault timeoutAttribute =
-      new Attribute.ComputedDefault() {
-        @Override
-        public Object getDefault(AttributeMap rule) {
-          TestSize size = TestSize.getTestSize(rule.get("size", Type.STRING));
-          if (size != null) {
-            String timeout = size.getDefaultTimeout().toString();
-            if (timeout != null) {
-              return timeout;
-            }
-          }
-          return "illegal";
-        }
-      };
 
   @Override
   public Provider provider(String doc, Object fields, StarlarkThread thread) throws EvalException {
@@ -296,6 +287,7 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
       Object buildSetting,
       Object cfg,
       Object execGroups,
+      Object compileOneFiletype,
       StarlarkThread thread)
       throws EvalException {
     BazelStarlarkContext bazelContext = BazelStarlarkContext.from(thread);
@@ -405,14 +397,23 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
       builder.setBuildSetting((BuildSetting) buildSetting);
     }
     if (!cfg.equals(Starlark.NONE)) {
-      if (!(cfg instanceof StarlarkDefinedConfigTransition)) {
+      if (cfg instanceof StarlarkDefinedConfigTransition) {
+        StarlarkDefinedConfigTransition starlarkDefinedConfigTransition =
+            (StarlarkDefinedConfigTransition) cfg;
+        builder.cfg(new StarlarkRuleTransitionProvider(starlarkDefinedConfigTransition));
+        builder.setHasStarlarkRuleTransition();
+      } else if (cfg instanceof PatchTransition) {
+        builder.cfg((PatchTransition) cfg);
+      } else if (cfg instanceof TransitionFactory) {
+        @SuppressWarnings("unchecked")
+        TransitionFactory<Rule> transitionFactory = (TransitionFactory<Rule>) cfg;
+        builder.cfg(transitionFactory);
+      } else {
+        // This is not technically true: it could also be a native transition, but this is the
+        // most likely error case.
         throw Starlark.errorf(
             "`cfg` must be set to a transition object initialized by the transition() function.");
       }
-      StarlarkDefinedConfigTransition starlarkDefinedConfigTransition =
-          (StarlarkDefinedConfigTransition) cfg;
-      builder.cfg(new StarlarkRuleTransitionProvider(starlarkDefinedConfigTransition));
-      builder.setHasStarlarkRuleTransition();
     }
 
     for (Object o : providesArg) {
@@ -430,6 +431,10 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
 
     if (!execCompatibleWith.isEmpty()) {
       builder.addExecutionPlatformConstraints(parseExecCompatibleWith(execCompatibleWith, thread));
+    }
+
+    if (compileOneFiletype instanceof String) {
+      builder.setPreferredDependencyPredicate(FileType.of((String) compileOneFiletype));
     }
 
     return new StarlarkRuleFunction(builder, type, attributes, thread.getCallerLocation());
@@ -518,8 +523,10 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
       StarlarkFunction implementation,
       Sequence<?> attributeAspects,
       Object attrs,
+      Sequence<?> requiredProvidersArg,
       Sequence<?> requiredAspectProvidersArg,
       Sequence<?> providesArg,
+      Sequence<?> requiredAspects,
       Sequence<?> fragments,
       Sequence<?> hostFragments,
       Sequence<?> toolchains,
@@ -603,14 +610,22 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
             Starlark.type(o));
       }
     }
+
+    if (applyToGeneratingRules && !requiredProvidersArg.isEmpty()) {
+      throw Starlark.errorf(
+          "An aspect cannot simultaneously have required providers and apply to generating rules.");
+    }
+
     return new StarlarkDefinedAspect(
         implementation,
         attrAspects.build(),
         attributes.build(),
+        StarlarkAttrModule.buildProviderPredicate(requiredProvidersArg, "required_providers"),
         StarlarkAttrModule.buildProviderPredicate(
             requiredAspectProvidersArg, "required_aspect_providers"),
         StarlarkAttrModule.getStarlarkProviderIdentifiers(providesArg),
         requiredParams.build(),
+        ImmutableSet.copyOf(Sequence.cast(requiredAspects, StarlarkAspect.class, "requires")),
         ImmutableSet.copyOf(Sequence.cast(fragments, String.class, "fragments")),
         HostTransition.INSTANCE,
         ImmutableSet.copyOf(Sequence.cast(hostFragments, String.class, "host_fragments")),
@@ -780,7 +795,6 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
             continue;
           }
           hasFunctionTransitionAllowlist = true;
-          builder.setHasFunctionTransitionAllowlist();
         }
 
         try {
@@ -792,15 +806,18 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
       }
       // TODO(b/121385274): remove when we stop allowlisting starlark transitions
       if (hasStarlarkDefinedTransition) {
-        if (!hasFunctionTransitionAllowlist) {
-          errorf(
-              handler,
-              "Use of Starlark transition without allowlist attribute"
-                  + " '_allowlist_function_transition'. See Starlark transitions documentation"
-                  + " for details and usage: %s %s",
-              builder.getRuleDefinitionEnvironmentLabel(),
-              builder.getType());
-          return;
+        if (!starlarkLabel.getRepository().getName().equals("@_builtins")) {
+          if (!hasFunctionTransitionAllowlist) {
+            errorf(
+                handler,
+                "Use of Starlark transition without allowlist attribute"
+                    + " '_allowlist_function_transition'. See Starlark transitions documentation"
+                    + " for details and usage: %s %s",
+                builder.getRuleDefinitionEnvironmentLabel(),
+                builder.getType());
+            return;
+          }
+          builder.addAllowlistChecker(FUNCTION_TRANSITION_ALLOWLIST_CHECKER);
         }
       } else {
         if (hasFunctionTransitionAllowlist) {
@@ -855,6 +872,14 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
       return true;
     }
   }
+
+  @SerializationConstant
+  static final AllowlistChecker FUNCTION_TRANSITION_ALLOWLIST_CHECKER =
+      AllowlistChecker.builder()
+          .setAllowlistAttr(FunctionSplitTransitionAllowlist.NAME)
+          .setErrorMessage("Non-allowlisted use of Starlark transition")
+          .setLocationCheck(AllowlistChecker.LocationCheck.INSTANCE_OR_DEFINITION)
+          .build();
 
   @Override
   public Label label(String labelString, Boolean relativeToCallerRepository, StarlarkThread thread)
@@ -927,7 +952,7 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
                 .getUnambiguousCanonicalForm();
       }
       return labelCache.get(labelString);
-    } catch (LabelValidator.BadLabelException | LabelSyntaxException | ExecutionException e) {
+    } catch (LabelValidator.BadLabelException | LabelSyntaxException e) {
       throw Starlark.errorf("Illegal absolute label syntax: %s", labelString);
     }
   }
@@ -944,7 +969,7 @@ public class StarlarkRuleClassFunctions implements StarlarkRuleFunctionsApi<Arti
         throw Starlark.errorf(
             "An exec group cannot set copy_from_rule=True and declare toolchains or constraints.");
       }
-      return ExecGroup.COPY_FROM_RULE_EXEC_GROUP;
+      return ExecGroup.copyFromDefault();
     }
 
     ImmutableSet<Label> toolchainTypes = ImmutableSet.copyOf(parseToolchains(toolchains, thread));

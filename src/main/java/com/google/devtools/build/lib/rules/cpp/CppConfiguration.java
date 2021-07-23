@@ -374,6 +374,10 @@ public final class CppConfiguration extends Fragment
     return cppOptions.useArgsParamsFile;
   }
 
+  public boolean useCcTestFeature() {
+    return cppOptions.enableCcTestFeature;
+  }
+
   /** Returns whether or not to strip the binaries. */
   public boolean shouldStripBinaries() {
     return stripBinaries;
@@ -800,6 +804,10 @@ public final class CppConfiguration extends Fragment
     return cppOptions.objcGenerateDotdFiles;
   }
 
+  public boolean experimentalCcImplementationDeps() {
+    return cppOptions.experimentalCcImplementationDeps;
+  }
+
   @Override
   public boolean macosSetInstallName() {
     return cppOptions.macosSetInstallName;
@@ -837,13 +845,13 @@ public final class CppConfiguration extends Fragment
 
   @Override
   public boolean processHeadersInDependenciesStarlark(StarlarkThread thread) throws EvalException {
-    checkInExpandedApiAllowlist(thread, "process_headers_in_dependencies");
+    CcModule.checkPrivateStarlarkificationAllowlist(thread);
     return processHeadersInDependencies();
   }
 
   @Override
   public boolean saveFeatureStateStarlark(StarlarkThread thread) throws EvalException {
-    checkInExpandedApiAllowlist(thread, "save_feature_state");
+    CcModule.checkPrivateStarlarkificationAllowlist(thread);
     return saveFeatureState();
   }
 

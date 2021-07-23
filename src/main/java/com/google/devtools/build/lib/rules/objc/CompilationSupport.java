@@ -55,6 +55,7 @@ import com.google.devtools.build.lib.actions.ParameterFile;
 import com.google.devtools.build.lib.analysis.AnalysisEnvironment;
 import com.google.devtools.build.lib.analysis.AnalysisUtils;
 import com.google.devtools.build.lib.analysis.FilesToRunProvider;
+import com.google.devtools.build.lib.analysis.OutputGroupInfo;
 import com.google.devtools.build.lib.analysis.PrerequisiteArtifacts;
 import com.google.devtools.build.lib.analysis.RuleContext;
 import com.google.devtools.build.lib.analysis.actions.CustomCommandLine;
@@ -75,7 +76,6 @@ import com.google.devtools.build.lib.packages.RuleClass.ConfiguredTargetFactory.
 import com.google.devtools.build.lib.packages.TargetUtils;
 import com.google.devtools.build.lib.rules.apple.AppleCommandLineOptions.AppleBitcodeMode;
 import com.google.devtools.build.lib.rules.apple.AppleConfiguration;
-import com.google.devtools.build.lib.rules.apple.XcodeConfig;
 import com.google.devtools.build.lib.rules.apple.XcodeConfigInfo;
 import com.google.devtools.build.lib.rules.cpp.CcCommon;
 import com.google.devtools.build.lib.rules.cpp.CcCompilationContext;
@@ -96,6 +96,7 @@ import com.google.devtools.build.lib.rules.cpp.CppModuleMap;
 import com.google.devtools.build.lib.rules.cpp.CppRuleClasses;
 import com.google.devtools.build.lib.rules.cpp.CppSemantics;
 import com.google.devtools.build.lib.rules.cpp.FdoContext;
+import com.google.devtools.build.lib.rules.cpp.FeatureConfigurationForStarlark;
 import com.google.devtools.build.lib.rules.cpp.Link.LinkTargetType;
 import com.google.devtools.build.lib.rules.cpp.Link.LinkingMode;
 import com.google.devtools.build.lib.rules.cpp.PrecompiledFiles;
@@ -114,6 +115,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Stream;
+import net.starlark.java.annot.Param;
+import net.starlark.java.annot.StarlarkMethod;
+import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.StarlarkValue;
 
 /**
  * Support for rules that compile sources. Provides ways to determine files that should be output,
@@ -127,7 +132,7 @@ import java.util.stream.Stream;
  *
  * <p>Methods on this class can be called in any order without impacting the result.
  */
-public class CompilationSupport {
+public class CompilationSupport implements StarlarkValue {
 
   @VisibleForTesting static final String OBJC_MODULE_CACHE_DIR_NAME = "_objc_module_cache";
 
@@ -170,8 +175,6 @@ public class CompilationSupport {
   private static final String DEAD_STRIP_FEATURE_NAME = "dead_strip";
 
   private static final String GENERATE_LINKMAP_FEATURE_NAME = "generate_linkmap";
-
-  private static final String XCODE_VERSION_FEATURE_NAME_PREFIX = "xcode_";
 
   private static final ImmutableList<String> OBJC_ACTIONS =
       ImmutableList.of(
@@ -457,7 +460,7 @@ public class CompilationSupport {
             ruleContext, ruleContext.getConfiguration(), ruleContext.getLabel());
     // Do a re-exporting merge of the ARC and non-ARC contexts so that the direct headers are
     // preserved in the unified context.
-    ccCompilationContextBuilder.mergeDependentCcCompilationContexts(
+    ccCompilationContextBuilder.addDependentCcCompilationContexts(
         Arrays.asList(
             objcArcCompilationInfo.getCcCompilationContext(),
             nonObjcArcCompilationInfo.getCcCompilationContext()),
@@ -491,8 +494,6 @@ public class CompilationSupport {
             ccToolchain,
             featureConfiguration,
             ruleContext,
-            /* generateHeaderTokensGroup= */ true,
-            /* addSelfHeaderTokens= */ true,
             /* generateHiddenTopLevelGroup= */ true);
 
     Map<String, NestedSet<Artifact>> nonArcOutputGroups =
@@ -503,8 +504,6 @@ public class CompilationSupport {
             ccToolchain,
             featureConfiguration,
             ruleContext,
-            /* generateHeaderTokensGroup= */ true,
-            /* addSelfHeaderTokens= */ false,
             /* generateHiddenTopLevelGroup= */ true);
 
     Map<String, NestedSet<Artifact>> mergedOutputGroups =
@@ -514,6 +513,24 @@ public class CompilationSupport {
         ccCompilationContextBuilder.build(),
         compilationOutputs,
         ImmutableMap.copyOf(mergedOutputGroups));
+  }
+
+  @StarlarkMethod(name = "feature_configuration", documented = false, structField = true)
+  public FeatureConfigurationForStarlark getFeatureConfigurationForStarlark() {
+    return FeatureConfigurationForStarlark.from(
+        getFeatureConfiguration(ruleContext, toolchain, buildConfiguration, cppSemantics),
+        ruleContext.getFragment(CppConfiguration.class),
+        buildConfiguration.getOptions());
+  }
+
+  @StarlarkMethod(name = "cc_toolchain", documented = false, structField = true)
+  public CcToolchainProvider getToolchain() {
+    return toolchain;
+  }
+
+  @StarlarkMethod(name = "output_group_info", documented = false, structField = true)
+  public OutputGroupInfo getOutputGroupInfo() {
+    return new OutputGroupInfo(ImmutableMap.copyOf(outputGroupCollector));
   }
 
   private FeatureConfiguration getFeatureConfiguration(
@@ -534,14 +551,6 @@ public class CompilationSupport {
     if (configuration.getFragment(ObjcConfiguration.class).generateLinkmap()) {
       activatedCrosstoolSelectables.add(GENERATE_LINKMAP_FEATURE_NAME);
     }
-    // Add a feature identifying the Xcode version so CROSSTOOL authors can enable flags for
-    // particular versions of Xcode. To ensure consistency across platforms, use exactly two
-    // components in the version number.
-    activatedCrosstoolSelectables.add(
-        XCODE_VERSION_FEATURE_NAME_PREFIX
-            + XcodeConfig.getXcodeConfigInfo(ruleContext)
-                .getXcodeVersion()
-                .toStringWithComponents(2));
 
     ImmutableSet.Builder<String> disabledFeatures =
         ImmutableSet.<String>builder().addAll(ruleContext.getDisabledFeatures());
@@ -683,6 +692,7 @@ public class CompilationSupport {
     this.ccCompilationContext = Optional.of(ccCompilationContext);
   }
 
+  @StarlarkMethod(name = "compilation_context", documented = false, structField = true)
   public CcCompilationContext getCcCompilationContext() {
     checkState(ccCompilationContext.isPresent());
     return ccCompilationContext.get();
@@ -728,9 +738,14 @@ public class CompilationSupport {
     this.disableLayeringCheck = disableLayeringCheck;
     this.disableParseHeaders = disableParseHeaders;
     if (toolchain == null
-        && ruleContext
-            .attributes()
-            .has(CcToolchain.CC_TOOLCHAIN_DEFAULT_ATTRIBUTE_NAME, BuildType.LABEL)) {
+        && (ruleContext
+                .attributes()
+                .has(CcToolchain.CC_TOOLCHAIN_DEFAULT_ATTRIBUTE_NAME, BuildType.LABEL)
+            || ruleContext
+                .attributes()
+                .has(
+                    CcToolchain.CC_TOOLCHAIN_DEFAULT_ATTRIBUTE_NAME_FOR_STARLARK,
+                    BuildType.LABEL))) {
       toolchain = CppHelper.getToolchainUsingDefaultCcToolchainAttribute(ruleContext);
     }
 
@@ -868,6 +883,11 @@ public class CompilationSupport {
     }
   }
 
+  @StarlarkMethod(name = "instrumented_files_info", documented = false, structField = true)
+  public InstrumentedFilesInfo getInstrumentedFilesProviderForStarlark() {
+    return getInstrumentedFilesProvider(objectFilesCollector.build());
+  }
+
   /**
    * Returns a provider that collects this target's instrumented sources as well as those of its
    * dependencies.
@@ -875,7 +895,13 @@ public class CompilationSupport {
    * @param objectFiles the object files generated by this target
    * @return an instrumented files provider
    */
-  public InstrumentedFilesInfo getInstrumentedFilesProvider(ImmutableList<Artifact> objectFiles) {
+  protected InstrumentedFilesInfo getInstrumentedFilesProvider(
+      ImmutableList<Artifact> objectFiles) {
+    return getInstrumentedFilesProvider(ruleContext, objectFiles);
+  }
+
+  protected static InstrumentedFilesInfo getInstrumentedFilesProvider(
+      RuleContext ruleContext, ImmutableList<Artifact> objectFiles) {
     return InstrumentedFilesCollector.collect(
         ruleContext,
         INSTRUMENTATION_SPEC,
@@ -930,6 +956,29 @@ public class CompilationSupport {
 
     ruleContext.assertNoErrors();
     return this;
+  }
+
+  @StarlarkMethod(name = "validate_attributes", documented = false)
+  public void validateAttributesForStarlark() throws EvalException {
+    try {
+      validateAttributes();
+    } catch (RuleErrorException ruleErrorException) {
+      throw new EvalException(ruleErrorException);
+    }
+  }
+
+  @StarlarkMethod(
+      name = "register_compile_and_archive_actions",
+      documented = false,
+      parameters = {@Param(name = "common", positional = false, named = true)})
+  public void registerCompileAndArchiveActionsForStarlark(ObjcCommon common)
+      throws EvalException, InterruptedException {
+    try {
+      registerCompileAndArchiveActions(
+          common, ExtraCompileArgs.NONE, ImmutableList.<PathFragment>of());
+    } catch (RuleErrorException ruleErrorException) {
+      throw new EvalException(ruleErrorException);
+    }
   }
 
   /**
@@ -998,7 +1047,6 @@ public class CompilationSupport {
     ObjcVariablesExtension.Builder extension =
         new ObjcVariablesExtension.Builder()
             .setRuleContext(ruleContext)
-            .setCompilationArtifacts(compilationArtifacts)
             .setIntermediateArtifacts(intermediateArtifacts)
             .setConfiguration(buildConfiguration);
 
@@ -1193,6 +1241,7 @@ public class CompilationSupport {
             .addNonCodeLinkerInputs(objcProvider.getCcLibraries())
             .addNonCodeLinkerInputs(ImmutableList.copyOf(prunedJ2ObjcArchives))
             .addNonCodeLinkerInputs(ImmutableList.copyOf(extraLinkInputs))
+            .addNonCodeLinkerInputs(ImmutableList.copyOf(attributes.linkInputs()))
             .addNonCodeLinkerInputs(ImmutableList.of(inputFileList))
             .addTransitiveAdditionalLinkerInputs(objcProvider.get(IMPORTED_LIBRARY))
             .addTransitiveAdditionalLinkerInputs(objcProvider.get(STATIC_FRAMEWORK_FILE))
@@ -1727,7 +1776,8 @@ public class CompilationSupport {
         NestedSetBuilder<Artifact> metadataFilesBuilder) {
       for (Artifact artifact : artifacts) {
         ActionAnalysisMetadata action = analysisEnvironment.getLocalGeneratingAction(artifact);
-        if (action.getMnemonic().equals("ObjcCompile")) {
+        if (action.getMnemonic().equals("ObjcCompile")
+            || action.getMnemonic().equals("ObjcCompileHeader")) {
           addOutputs(metadataFilesBuilder, action, ObjcRuleClasses.COVERAGE_NOTES);
         }
       }

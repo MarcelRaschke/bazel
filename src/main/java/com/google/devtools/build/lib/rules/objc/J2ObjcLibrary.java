@@ -57,8 +57,8 @@ public class J2ObjcLibrary implements RuleConfiguredTargetFactory {
     return new ObjcCommon.Builder(ObjcCommon.Purpose.LINK_ONLY, ruleContext)
         .setCompilationAttributes(
             CompilationAttributes.Builder.fromRuleContext(ruleContext).build())
-        .addDeps(ruleContext.getPrerequisiteConfiguredTargets("deps"))
-        .addDeps(ruleContext.getPrerequisiteConfiguredTargets("jre_deps"))
+        .addDeps(ruleContext.getPrerequisites("deps"))
+        .addDeps(ruleContext.getPrerequisites("jre_deps"))
         .addDirectCcCompilationContexts(
             j2objcCcInfos.stream().map(J2ObjcCcInfo::getCcInfo).collect(toList()))
         .setIntermediateArtifacts(ObjcRuleClasses.intermediateArtifacts(ruleContext))
@@ -85,7 +85,7 @@ public class J2ObjcLibrary implements RuleConfiguredTargetFactory {
 
     J2ObjcMappingFileProvider j2ObjcMappingFileProvider =
         J2ObjcMappingFileProvider.union(
-            ruleContext.getPrerequisites("deps", J2ObjcMappingFileProvider.class));
+            ruleContext.getPrerequisites("deps", J2ObjcMappingFileProvider.PROVIDER));
 
     CompilationArtifacts moduleMapCompilationArtifacts =
         new CompilationArtifacts.Builder()
@@ -102,8 +102,8 @@ public class J2ObjcLibrary implements RuleConfiguredTargetFactory {
     return new RuleConfiguredTargetBuilder(ruleContext)
         .setFilesToBuild(NestedSetBuilder.<Artifact>emptySet(STABLE_ORDER))
         .add(RunfilesProvider.class, RunfilesProvider.EMPTY)
-        .addProvider(J2ObjcEntryClassProvider.class, j2ObjcEntryClassProvider)
-        .addProvider(J2ObjcMappingFileProvider.class, j2ObjcMappingFileProvider)
+        .addNativeDeclaredProvider(j2ObjcEntryClassProvider)
+        .addNativeDeclaredProvider(j2ObjcMappingFileProvider)
         .addNativeDeclaredProvider(objcProvider)
         .addNativeDeclaredProvider(
             CcInfo.builder().setCcCompilationContext(common.getCcCompilationContext()).build())

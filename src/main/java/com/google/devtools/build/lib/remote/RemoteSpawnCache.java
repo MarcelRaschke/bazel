@@ -22,17 +22,18 @@ import com.google.common.base.Throwables;
 import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
+import com.google.devtools.build.lib.actions.ForbiddenActionInputException;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.SpawnResult.Status;
-import com.google.devtools.build.lib.actions.Spawns;
 import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.exec.SpawnCache;
-import com.google.devtools.build.lib.exec.SpawnRunner.ProgressStatus;
+import com.google.devtools.build.lib.exec.SpawnCheckingCacheEvent;
+import com.google.devtools.build.lib.exec.SpawnExecutingEvent;
 import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
@@ -53,6 +54,12 @@ import javax.annotation.Nullable;
 /** A remote {@link SpawnCache} implementation. */
 @ThreadSafe // If the RemoteActionCache implementation is thread-safe.
 final class RemoteSpawnCache implements SpawnCache {
+
+  private static final SpawnCheckingCacheEvent SPAWN_CHECKING_CACHE_EVENT =
+      SpawnCheckingCacheEvent.create("remote-cache");
+
+  private static final SpawnExecutingEvent SPAWN_EXECUTING_EVENT =
+      SpawnExecutingEvent.create("remote-cache");
 
   private final Path execRoot;
   private final RemoteOptions options;
@@ -76,9 +83,11 @@ final class RemoteSpawnCache implements SpawnCache {
 
   @Override
   public CacheHandle lookup(Spawn spawn, SpawnExecutionContext context)
-      throws InterruptedException, IOException, ExecException {
-    if (!Spawns.mayBeCached(spawn)
-        || (!Spawns.mayBeCachedRemotely(spawn) && useRemoteCache(options))) {
+      throws InterruptedException, IOException, ExecException, ForbiddenActionInputException {
+    boolean mayBeCached =
+        remoteExecutionService.mayBeCachedRemotely(spawn)
+            || (!useRemoteCache(options) && remoteExecutionService.mayBeCached(spawn));
+    if (!mayBeCached) {
       // returning SpawnCache.NO_RESULT_NO_STORE in case the caching is disabled or in case
       // the remote caching is disabled and the only configured cache is remote.
       return SpawnCache.NO_RESULT_NO_STORE;
@@ -95,7 +104,7 @@ final class RemoteSpawnCache implements SpawnCache {
     Profiler prof = Profiler.instance();
     if (options.remoteAcceptCached
         || (options.incompatibleRemoteResultsIgnoreDisk && useDiskCache(options))) {
-      context.report(ProgressStatus.CHECKING_CACHE, "remote-cache");
+      context.report(SPAWN_CHECKING_CACHE_EVENT);
       // Metadata will be available in context.current() until we detach.
       // This is done via a thread-local variable.
       try {
@@ -148,6 +157,8 @@ final class RemoteSpawnCache implements SpawnCache {
         }
       }
     }
+
+    context.report(SPAWN_EXECUTING_EVENT);
 
     context.prefetchInputs();
 

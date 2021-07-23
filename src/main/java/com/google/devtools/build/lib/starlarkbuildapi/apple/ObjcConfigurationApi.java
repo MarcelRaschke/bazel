@@ -75,12 +75,6 @@ public interface ObjcConfigurationApi<ApplePlatformTypeApiT extends ApplePlatfor
   DottedVersionApi<?> getSimulatorVersionForPlatformType(ApplePlatformTypeApiT platformType);
 
   @StarlarkMethod(
-      name = "generate_dsym",
-      doc = "Whether to generate debug symbol(.dSYM) artifacts.",
-      structField = true)
-  boolean generateDsym();
-
-  @StarlarkMethod(
       name = "generate_linkmap",
       doc = "Whether to generate linkmap artifacts.",
       structField = true)
@@ -132,10 +126,4 @@ public interface ObjcConfigurationApi<ApplePlatformTypeApiT extends ApplePlatfor
           "Returns whether device debug entitlements should be included when signing an "
               + "application.")
   boolean useDeviceDebugEntitlements();
-
-  @StarlarkMethod(
-      name = "enable_apple_binary_native_protos",
-      structField = true,
-      doc = "Returns whether apple_binary should generate and link protos natively.")
-  boolean enableAppleBinaryNativeProtos();
 }

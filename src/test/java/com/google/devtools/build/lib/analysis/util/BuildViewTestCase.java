@@ -13,6 +13,7 @@
 // limitations under the License.
 package com.google.devtools.build.lib.analysis.util;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
@@ -58,6 +59,7 @@ import com.google.devtools.build.lib.actions.MetadataProvider;
 import com.google.devtools.build.lib.actions.MiddlemanFactory;
 import com.google.devtools.build.lib.actions.MutableActionGraph;
 import com.google.devtools.build.lib.actions.ParameterFile;
+import com.google.devtools.build.lib.actions.ThreadStateReceiver;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.actions.util.DummyExecutor;
 import com.google.devtools.build.lib.analysis.AnalysisEnvironment;
@@ -169,6 +171,7 @@ import com.google.devtools.build.lib.vfs.ModifiedFileSet;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
+import com.google.devtools.build.lib.vfs.UnixGlob;
 import com.google.devtools.build.skyframe.ErrorInfo;
 import com.google.devtools.build.skyframe.InMemoryMemoizingEvaluator;
 import com.google.devtools.build.skyframe.MemoizingEvaluator;
@@ -295,6 +298,7 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
             PrecomputedValue.injected(
                 RepositoryDelegatorFunction.DEPENDENCY_FOR_UNCONDITIONAL_FETCHING,
                 RepositoryDelegatorFunction.DONT_FETCH_UNCONDITIONALLY),
+            PrecomputedValue.injected(RepositoryDelegatorFunction.ENABLE_BZLMOD, enableBzlmod()),
             PrecomputedValue.injected(
                 BuildInfoCollectionFunction.BUILD_INFO_FACTORIES,
                 ruleClassProvider.getBuildInfoFactoriesAsMap()));
@@ -316,8 +320,6 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
             .setFileSystem(fileSystem)
             .setDirectories(directories)
             .setActionKeyContext(actionKeyContext)
-            .setDefaultBuildOptions(
-                DefaultBuildOptionsForTesting.getDefaultBuildOptionsForTest(ruleClassProvider))
             .setWorkspaceStatusActionFactory(workspaceStatusActionFactory)
             .setExtraSkyFunctions(analysisMock.getSkyFunctions(directories))
             .setManagedDirectoriesKnowledge(getManagedDirectoriesKnowledge())
@@ -376,6 +378,11 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
    * @see BzlLoadFunction#computeInline
    */
   protected boolean usesInliningBzlLoadFunction() {
+    return false;
+  }
+
+  /** Returns whether or not to enable Bzlmod in this test. */
+  protected boolean enableBzlmod() {
     return false;
   }
 
@@ -509,6 +516,7 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
         ImmutableList.of(
             PrecomputedValue.injected(
                 RepositoryDelegatorFunction.RESOLVED_FILE_INSTEAD_OF_WORKSPACE, Optional.empty()),
+            PrecomputedValue.injected(RepositoryDelegatorFunction.ENABLE_BZLMOD, enableBzlmod()),
             PrecomputedValue.injected(
                 RepositoryDelegatorFunction.OUTPUT_VERIFICATION_REPOSITORY_RULES,
                 ImmutableSet.of()),
@@ -681,13 +689,11 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
   protected final ConfiguredTarget getDirectPrerequisite(ConfiguredTarget target, String label)
       throws Exception {
     Label candidateLabel = Label.parseAbsolute(label, ImmutableMap.of());
-    for (ConfiguredTarget candidate : getDirectPrerequisites(target)) {
-      if (candidate.getLabel().equals(candidateLabel)) {
-        return candidate;
-      }
-    }
-
-    return null;
+    Optional<ConfiguredTarget> prereq =
+        getDirectPrerequisites(target).stream()
+            .filter(candidate -> candidate.getOriginalLabel().equals(candidateLabel))
+            .findFirst();
+    return prereq.orElse(null);
   }
 
   protected final ConfiguredTargetAndData getConfiguredTargetAndDataDirectPrerequisite(
@@ -910,18 +916,6 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
     return getGeneratingAction(outputName, filesToBuild, "filesToBuild");
   }
 
-  private static Artifact findArtifactNamed(
-      String name, NestedSet<Artifact> artifacts, Object context) {
-    return artifacts.toList().stream()
-        .filter(artifactNamed(name))
-        .findFirst()
-        .orElseThrow(
-            () ->
-                new NoSuchElementException(
-                    String.format(
-                        "Artifact named '%s' not found in %s (%s)", name, context, artifacts)));
-  }
-
   private Action getGeneratingAction(
       String outputName, NestedSet<Artifact> filesToBuild, String providerName) {
     return getGeneratingAction(findArtifactNamed(outputName, filesToBuild, providerName));
@@ -937,6 +931,18 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
     } else {
       return null;
     }
+  }
+
+  private static Artifact findArtifactNamed(
+      String name, NestedSet<Artifact> artifacts, Object context) {
+    return artifacts.toList().stream()
+        .filter(artifactNamed(name))
+        .findFirst()
+        .orElseThrow(
+            () ->
+                new NoSuchElementException(
+                    String.format(
+                        "Artifact named '%s' not found in %s (%s)", name, context, artifacts)));
   }
 
   protected Action getGeneratingActionInOutputGroup(
@@ -1052,6 +1058,19 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
    */
   protected FileConfiguredTarget getFileConfiguredTarget(String label) throws LabelSyntaxException {
     return (FileConfiguredTarget) getConfiguredTarget(label, targetConfig);
+  }
+
+  /**
+   * Returns the Artifact for the specified label, configured for the "build" (aka "target")
+   * configuration.
+   */
+  protected Artifact getArtifact(String label) throws LabelSyntaxException {
+    ConfiguredTarget target = getConfiguredTarget(label, targetConfig);
+    if (target instanceof FileConfiguredTarget) {
+      return ((FileConfiguredTarget) target).getArtifact();
+    } else {
+      return getFilesToBuild(target).getSingleton();
+    }
   }
 
   /**
@@ -1297,6 +1316,14 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
    */
   protected Set<String> artifactsToStrings(Iterable<? extends Artifact> artifacts) {
     return AnalysisTestUtil.artifactsToStrings(masterConfig, artifacts);
+  }
+
+  /**
+   * Given a list of PathFragments, returns a corresponding list of strings. Such strings make
+   * assertions easier to write.
+   */
+  protected List<String> pathfragmentsToStrings(List<PathFragment> pathFragments) {
+    return pathFragments.stream().map(PathFragment::toString).collect(toImmutableList());
   }
 
   /**
@@ -1634,19 +1661,7 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
   }
 
   protected Action getGeneratingActionForLabel(String label) throws Exception {
-    return getGeneratingAction(getFileConfiguredTarget(label).getArtifact());
-  }
-
-  /**
-   * Strips the C++-contributed prefix out of an output path when tests are run with trimmed
-   * configurations. e.g. turns "bazel-out/gcc-X-glibc-Y-k8-fastbuild/ to "bazel-out/fastbuild/".
-   *
-   * <p>This should be used for targets use configurations with C++ fragments.
-   */
-  protected String stripCppPrefixForTrimmedConfigs(String outputPath) {
-    return targetConfig.trimConfigurations()
-        ? AnalysisTestUtil.OUTPUT_PATH_CPP_PREFIX_PATTERN.matcher(outputPath).replaceFirst("")
-        : outputPath;
+    return getGeneratingAction(getArtifact(label));
   }
 
   protected static String fileName(Artifact artifact) {
@@ -1755,8 +1770,8 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
    */
   protected void assertSameContentsWithCommonElements(Iterable<String> artifacts,
       String[] expectedInputs, Iterable<String> common) {
-    assertThat(Iterables.concat(Lists.newArrayList(expectedInputs), common))
-        .containsExactlyElementsIn(artifacts);
+    assertThat(artifacts)
+        .containsExactlyElementsIn(Iterables.concat(Lists.newArrayList(expectedInputs), common));
   }
 
   /**
@@ -2451,7 +2466,9 @@ public abstract class BuildViewTestCase extends FoundationTestCase {
           artifactExpander,
           /*actionFileSystem=*/ null,
           /*skyframeDepsResult*/ null,
-          NestedSetExpander.DEFAULT);
+          NestedSetExpander.DEFAULT,
+          UnixGlob.DEFAULT_SYSCALLS,
+          ThreadStateReceiver.NULL_INSTANCE);
     }
   }
 }

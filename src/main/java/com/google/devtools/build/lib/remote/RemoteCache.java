@@ -15,6 +15,8 @@ package com.google.devtools.build.lib.remote;
 
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static com.google.devtools.build.lib.remote.common.ProgressStatusListener.NO_ACTION;
+import static com.google.devtools.build.lib.remote.util.Utils.bytesCountToDisplayString;
 import static com.google.devtools.build.lib.remote.util.Utils.getFromFuture;
 
 import build.bazel.remote.execution.v2.Action;
@@ -39,6 +41,7 @@ import com.google.common.flogger.GoogleLogger;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.actions.Artifact;
@@ -49,12 +52,16 @@ import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.UserExecException;
 import com.google.devtools.build.lib.actions.cache.MetadataInjector;
 import com.google.devtools.build.lib.concurrent.ThreadSafety;
+import com.google.devtools.build.lib.exec.SpawnProgressEvent;
 import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.DirectoryMetadata;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.FileMetadata;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.SymlinkMetadata;
+import com.google.devtools.build.lib.remote.common.LazyFileOutputStream;
+import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;
+import com.google.devtools.build.lib.remote.common.ProgressStatusListener;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteActionFileArtifactValue;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient;
@@ -88,6 +95,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -110,6 +120,8 @@ public class RemoteCache implements AutoCloseable {
   protected final RemoteOptions options;
   protected final DigestUtil digestUtil;
 
+  private Path captureCorruptedOutputsDir;
+
   public RemoteCache(
       RemoteCacheClient cacheProtocol, RemoteOptions options, DigestUtil digestUtil) {
     this.cacheProtocol = cacheProtocol;
@@ -117,10 +129,46 @@ public class RemoteCache implements AutoCloseable {
     this.digestUtil = digestUtil;
   }
 
+  public void setCaptureCorruptedOutputsDir(Path captureCorruptedOutputsDir) {
+    this.captureCorruptedOutputsDir = captureCorruptedOutputsDir;
+  }
+
   public ActionResult downloadActionResult(
       RemoteActionExecutionContext context, ActionKey actionKey, boolean inlineOutErr)
       throws IOException, InterruptedException {
     return getFromFuture(cacheProtocol.downloadActionResult(context, actionKey, inlineOutErr));
+  }
+
+  /**
+   * Upload a local file to the remote cache.
+   *
+   * @param context the context for the action.
+   * @param digest the digest of the file.
+   * @param file the file to upload.
+   */
+  public final ListenableFuture<Void> uploadFile(
+      RemoteActionExecutionContext context, Digest digest, Path file) {
+    if (digest.getSizeBytes() == 0) {
+      return COMPLETED_SUCCESS;
+    }
+
+    return cacheProtocol.uploadFile(context, digest, file);
+  }
+
+  /**
+   * Upload sequence of bytes to the remote cache.
+   *
+   * @param context the context for the action.
+   * @param digest the digest of the file.
+   * @param data the BLOB to upload.
+   */
+  public final ListenableFuture<Void> uploadBlob(
+      RemoteActionExecutionContext context, Digest digest, ByteString data) {
+    if (digest.getSizeBytes() == 0) {
+      return COMPLETED_SUCCESS;
+    }
+
+    return cacheProtocol.uploadBlob(context, digest, data);
   }
 
   /**
@@ -203,14 +251,14 @@ public class RemoteCache implements AutoCloseable {
     for (Digest digest : digestsToUpload) {
       Path file = digestToFile.get(digest);
       if (file != null) {
-        uploads.add(cacheProtocol.uploadFile(context, digest, file));
+        uploads.add(uploadFile(context, digest, file));
       } else {
         ByteString blob = digestToBlobs.get(digest);
         if (blob == null) {
           String message = "FindMissingBlobs call returned an unknown digest: " + digest;
           throw new IOException(message);
         }
-        uploads.add(cacheProtocol.uploadBlob(context, digest, blob));
+        uploads.add(uploadBlob(context, digest, blob));
       }
     }
 
@@ -301,8 +349,61 @@ public class RemoteCache implements AutoCloseable {
     return outerF;
   }
 
+  private ListenableFuture<Void> downloadBlob(
+      RemoteActionExecutionContext context, Digest digest, OutputStream out) {
+    if (digest.getSizeBytes() == 0) {
+      return COMPLETED_SUCCESS;
+    }
+
+    return cacheProtocol.downloadBlob(context, digest, out);
+  }
+
   private static Path toTmpDownloadPath(Path actualPath) {
     return actualPath.getParentDirectory().getRelative(actualPath.getBaseName() + ".tmp");
+  }
+
+  static class DownloadProgressReporter {
+    private static final Pattern PATTERN = Pattern.compile("^bazel-out/[^/]+/[^/]+/");
+    private final ProgressStatusListener listener;
+    private final String id;
+    private final String file;
+    private final String totalSize;
+    private final AtomicLong downloadedBytes = new AtomicLong(0);
+
+    DownloadProgressReporter(ProgressStatusListener listener, String file, long totalSize) {
+      this.listener = listener;
+      this.id = file;
+      this.totalSize = bytesCountToDisplayString(totalSize);
+
+      Matcher matcher = PATTERN.matcher(file);
+      this.file = matcher.replaceFirst("");
+    }
+
+    void started() {
+      reportProgress(false, false);
+    }
+
+    void downloadedBytes(int count) {
+      downloadedBytes.addAndGet(count);
+      reportProgress(true, false);
+    }
+
+    void finished() {
+      reportProgress(true, true);
+    }
+
+    private void reportProgress(boolean includeBytes, boolean finished) {
+      String progress;
+      if (includeBytes) {
+        progress =
+            String.format(
+                "Downloading %s, %s / %s",
+                file, bytesCountToDisplayString(downloadedBytes.get()), totalSize);
+      } else {
+        progress = String.format("Downloading %s", file);
+      }
+      listener.onProgressStatus(SpawnProgressEvent.create(id, progress, finished));
+    }
   }
 
   /**
@@ -321,7 +422,8 @@ public class RemoteCache implements AutoCloseable {
       RemotePathResolver remotePathResolver,
       ActionResult result,
       FileOutErr origOutErr,
-      OutputFilesLocker outputFilesLocker)
+      OutputFilesLocker outputFilesLocker,
+      ProgressStatusListener progressStatusListener)
       throws ExecException, IOException, InterruptedException {
     ActionResultMetadata metadata = parseActionResultMetadata(context, remotePathResolver, result);
 
@@ -334,7 +436,15 @@ public class RemoteCache implements AutoCloseable {
                 (file) -> {
                   try {
                     ListenableFuture<Void> download =
-                        downloadFile(context, toTmpDownloadPath(file.path()), file.digest());
+                        downloadFile(
+                            context,
+                            remotePathResolver.localPathToOutputPath(file.path()),
+                            toTmpDownloadPath(file.path()),
+                            file.digest(),
+                            new DownloadProgressReporter(
+                                progressStatusListener,
+                                remotePathResolver.localPathToOutputPath(file.path()),
+                                file.digest().getSizeBytes()));
                     return Futures.transform(download, (d) -> file, directExecutor());
                   } catch (IOException e) {
                     return Futures.<FileMetadata>immediateFailedFuture(e);
@@ -355,6 +465,30 @@ public class RemoteCache implements AutoCloseable {
     try {
       waitForBulkTransfer(downloads, /* cancelRemainingOnInterrupt=*/ true);
     } catch (Exception e) {
+      if (captureCorruptedOutputsDir != null) {
+        if (e instanceof BulkTransferException) {
+          for (Throwable suppressed : e.getSuppressed()) {
+            if (suppressed instanceof OutputDigestMismatchException) {
+              // Capture corrupted outputs
+              try {
+                String outputPath = ((OutputDigestMismatchException) suppressed).getOutputPath();
+                Path localPath = ((OutputDigestMismatchException) suppressed).getLocalPath();
+                Path dst = captureCorruptedOutputsDir.getRelative(outputPath);
+                dst.createDirectoryAndParents();
+
+                // Make sure dst is still under captureCorruptedOutputsDir, otherwise
+                // IllegalArgumentException will be thrown.
+                dst.relativeTo(captureCorruptedOutputsDir);
+
+                FileSystemUtils.copyFile(localPath, dst);
+              } catch (Exception ee) {
+                ee.addSuppressed(ee);
+              }
+            }
+          }
+        }
+      }
+
       try {
         // Delete any (partially) downloaded output files.
         for (OutputFile file : result.getOutputFilesList()) {
@@ -461,9 +595,51 @@ public class RemoteCache implements AutoCloseable {
     }
   }
 
+  public ListenableFuture<Void> downloadFile(
+      RemoteActionExecutionContext context,
+      String outputPath,
+      Path localPath,
+      Digest digest,
+      DownloadProgressReporter reporter)
+      throws IOException {
+    SettableFuture<Void> outerF = SettableFuture.create();
+    ListenableFuture<Void> f = downloadFile(context, localPath, digest, reporter);
+    Futures.addCallback(
+        f,
+        new FutureCallback<Void>() {
+          @Override
+          public void onSuccess(Void unused) {
+            outerF.set(null);
+          }
+
+          @Override
+          public void onFailure(Throwable throwable) {
+            if (throwable instanceof OutputDigestMismatchException) {
+              OutputDigestMismatchException e = ((OutputDigestMismatchException) throwable);
+              e.setOutputPath(outputPath);
+              e.setLocalPath(localPath);
+            }
+            outerF.setException(throwable);
+          }
+        },
+        MoreExecutors.directExecutor());
+
+    return outerF;
+  }
+
   /** Downloads a file (that is not a directory). The content is fetched from the digest. */
   public ListenableFuture<Void> downloadFile(
       RemoteActionExecutionContext context, Path path, Digest digest) throws IOException {
+    return downloadFile(context, path, digest, new DownloadProgressReporter(NO_ACTION, "", 0));
+  }
+
+  /** Downloads a file (that is not a directory). The content is fetched from the digest. */
+  public ListenableFuture<Void> downloadFile(
+      RemoteActionExecutionContext context,
+      Path path,
+      Digest digest,
+      DownloadProgressReporter reporter)
+      throws IOException {
     Preconditions.checkNotNull(path.getParentDirectory()).createDirectoryAndParents();
     if (digest.getSizeBytes() == 0) {
       // Handle empty file locally.
@@ -484,7 +660,9 @@ public class RemoteCache implements AutoCloseable {
       return COMPLETED_SUCCESS;
     }
 
-    OutputStream out = new LazyFileOutputStream(path);
+    reporter.started();
+    OutputStream out = new ReportingOutputStream(new LazyFileOutputStream(path), reporter);
+
     SettableFuture<Void> outerF = SettableFuture.create();
     ListenableFuture<Void> f = cacheProtocol.downloadBlob(context, digest, out);
     Futures.addCallback(
@@ -495,6 +673,7 @@ public class RemoteCache implements AutoCloseable {
             try {
               out.close();
               outerF.set(null);
+              reporter.finished();
             } catch (IOException e) {
               outerF.setException(e);
             } catch (RuntimeException e) {
@@ -507,6 +686,7 @@ public class RemoteCache implements AutoCloseable {
           public void onFailure(Throwable t) {
             try {
               out.close();
+              reporter.finished();
             } catch (IOException e) {
               if (t != e) {
                 t.addSuppressed(e);
@@ -523,7 +703,14 @@ public class RemoteCache implements AutoCloseable {
     return outerF;
   }
 
-  private List<ListenableFuture<FileMetadata>> downloadOutErr(
+  /**
+   * Download the stdout and stderr of an executed action.
+   *
+   * @param context the context for the action.
+   * @param result the result of the action.
+   * @param outErr the {@link OutErr} that the stdout and stderr will be downloaded to.
+   */
+  public final List<ListenableFuture<FileMetadata>> downloadOutErr(
       RemoteActionExecutionContext context, ActionResult result, OutErr outErr) {
     List<ListenableFuture<FileMetadata>> downloads = new ArrayList<>();
     if (!result.getStdoutRaw().isEmpty()) {
@@ -536,8 +723,7 @@ public class RemoteCache implements AutoCloseable {
     } else if (result.hasStdoutDigest()) {
       downloads.add(
           Futures.transform(
-              cacheProtocol.downloadBlob(
-                  context, result.getStdoutDigest(), outErr.getOutputStream()),
+              downloadBlob(context, result.getStdoutDigest(), outErr.getOutputStream()),
               (d) -> null,
               directExecutor()));
     }
@@ -551,8 +737,7 @@ public class RemoteCache implements AutoCloseable {
     } else if (result.hasStderrDigest()) {
       downloads.add(
           Futures.transform(
-              cacheProtocol.downloadBlob(
-                  context, result.getStderrDigest(), outErr.getErrorStream()),
+              downloadBlob(context, result.getStderrDigest(), outErr.getErrorStream()),
               (d) -> null,
               directExecutor()));
     }
@@ -1036,53 +1221,45 @@ public class RemoteCache implements AutoCloseable {
   }
 
   /**
-   * Creates an {@link OutputStream} that isn't actually opened until the first data is written.
-   * This is useful to only have as many open file descriptors as necessary at a time to avoid
-   * running into system limits.
+   * An {@link OutputStream} that reports all the write operations with {@link
+   * DownloadProgressReporter}.
    */
-  private static class LazyFileOutputStream extends OutputStream {
+  private static class ReportingOutputStream extends OutputStream {
 
-    private final Path path;
-    private OutputStream out;
+    private final OutputStream out;
+    private final DownloadProgressReporter reporter;
 
-    public LazyFileOutputStream(Path path) {
-      this.path = path;
+    ReportingOutputStream(OutputStream out, DownloadProgressReporter reporter) {
+      this.out = out;
+      this.reporter = reporter;
     }
 
     @Override
     public void write(byte[] b) throws IOException {
-      ensureOpen();
       out.write(b);
+      reporter.downloadedBytes(b.length);
     }
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
-      ensureOpen();
       out.write(b, off, len);
+      reporter.downloadedBytes(len);
     }
 
     @Override
     public void write(int b) throws IOException {
-      ensureOpen();
       out.write(b);
+      reporter.downloadedBytes(1);
     }
 
     @Override
     public void flush() throws IOException {
-      ensureOpen();
       out.flush();
     }
 
     @Override
     public void close() throws IOException {
-      ensureOpen();
       out.close();
-    }
-
-    private void ensureOpen() throws IOException {
-      if (out == null) {
-        out = path.getOutputStream();
-      }
     }
   }
 

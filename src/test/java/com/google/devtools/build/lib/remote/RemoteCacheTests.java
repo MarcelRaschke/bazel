@@ -56,6 +56,7 @@ import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.clock.JavaClock;
 import com.google.devtools.build.lib.remote.RemoteCache.OutputFilesLocker;
 import com.google.devtools.build.lib.remote.RemoteCache.UploadManifest;
+import com.google.devtools.build.lib.remote.common.ProgressStatusListener;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
@@ -102,6 +103,7 @@ import org.mockito.MockitoAnnotations;
 public class RemoteCacheTests {
 
   @Mock private OutputFilesLocker outputFilesLocker;
+  private final ProgressStatusListener progressStatusListener = progress -> {};
 
   private RemoteActionExecutionContext context;
   private RemotePathResolver remotePathResolver;
@@ -608,13 +610,20 @@ public class RemoteCacheTests {
     assertThat(e).hasMessageThat().contains("--remote_allow_symlink_upload");
   }
 
+  // TODO(chiwang): Cleanup the tests, e.g. use java test data builder pattern.
   @Test
   public void downloadRelativeFileSymlink() throws Exception {
     RemoteCache cache = newRemoteCache();
     ActionResult.Builder result = ActionResult.newBuilder();
     result.addOutputFileSymlinksBuilder().setPath("a/b/link").setTarget("../../foo");
     // Doesn't check for dangling links, hence download succeeds.
-    cache.download(context, remotePathResolver, result.build(), null, outputFilesLocker);
+    cache.download(
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
     Path path = execRoot.getRelative("a/b/link");
     assertThat(path.isSymbolicLink()).isTrue();
     assertThat(path.readSymbolicLink()).isEqualTo(PathFragment.create("../../foo"));
@@ -627,7 +636,13 @@ public class RemoteCacheTests {
     ActionResult.Builder result = ActionResult.newBuilder();
     result.addOutputDirectorySymlinksBuilder().setPath("a/b/link").setTarget("foo");
     // Doesn't check for dangling links, hence download succeeds.
-    cache.download(context, remotePathResolver, result.build(), null, outputFilesLocker);
+    cache.download(
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
     Path path = execRoot.getRelative("a/b/link");
     assertThat(path.isSymbolicLink()).isTrue();
     assertThat(path.readSymbolicLink()).isEqualTo(PathFragment.create("foo"));
@@ -647,7 +662,13 @@ public class RemoteCacheTests {
     ActionResult.Builder result = ActionResult.newBuilder();
     result.addOutputDirectoriesBuilder().setPath("dir").setTreeDigest(treeDigest);
     // Doesn't check for dangling links, hence download succeeds.
-    cache.download(context, remotePathResolver, result.build(), null, outputFilesLocker);
+    cache.download(
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
     Path path = execRoot.getRelative("dir/link");
     assertThat(path.isSymbolicLink()).isTrue();
     assertThat(path.readSymbolicLink()).isEqualTo(PathFragment.create("../foo"));
@@ -664,7 +685,12 @@ public class RemoteCacheTests {
             IOException.class,
             () ->
                 cache.download(
-                    context, remotePathResolver, result.build(), null, outputFilesLocker));
+                    context,
+                    remotePathResolver,
+                    result.build(),
+                    null,
+                    outputFilesLocker,
+                    progressStatusListener));
     assertThat(expected).hasMessageThat().contains("/abs/link");
     assertThat(expected).hasMessageThat().contains("absolute path");
     verify(outputFilesLocker).lock();
@@ -680,7 +706,12 @@ public class RemoteCacheTests {
             IOException.class,
             () ->
                 cache.download(
-                    context, remotePathResolver, result.build(), null, outputFilesLocker));
+                    context,
+                    remotePathResolver,
+                    result.build(),
+                    null,
+                    outputFilesLocker,
+                    progressStatusListener));
     assertThat(expected).hasMessageThat().contains("/abs/link");
     assertThat(expected).hasMessageThat().contains("absolute path");
     verify(outputFilesLocker).lock();
@@ -703,7 +734,12 @@ public class RemoteCacheTests {
             IOException.class,
             () ->
                 cache.download(
-                    context, remotePathResolver, result.build(), null, outputFilesLocker));
+                    context,
+                    remotePathResolver,
+                    result.build(),
+                    null,
+                    outputFilesLocker,
+                    progressStatusListener));
     assertThat(expected.getSuppressed()).isEmpty();
     assertThat(expected).hasMessageThat().contains("dir/link");
     assertThat(expected).hasMessageThat().contains("/foo");
@@ -727,7 +763,14 @@ public class RemoteCacheTests {
     result.addOutputFiles(OutputFile.newBuilder().setPath("otherfile").setDigest(otherFileDigest));
     assertThrows(
         BulkTransferException.class,
-        () -> cache.download(context, remotePathResolver, result.build(), null, outputFilesLocker));
+        () ->
+            cache.download(
+                context,
+                remotePathResolver,
+                result.build(),
+                null,
+                outputFilesLocker,
+                progressStatusListener));
     assertThat(cache.getNumFailedDownloads()).isEqualTo(1);
     assertThat(execRoot.getRelative("outputdir").exists()).isTrue();
     assertThat(execRoot.getRelative("outputdir/outputfile").exists()).isFalse();
@@ -765,7 +808,8 @@ public class RemoteCacheTests {
                     remotePathResolver,
                     result,
                     new FileOutErr(stdout, stderr),
-                    outputFilesLocker));
+                    outputFilesLocker,
+                    progressStatusListener));
     assertThat(downloadException.getSuppressed()).hasLength(1);
     assertThat(cache.getNumSuccessfulDownloads()).isEqualTo(2);
     assertThat(cache.getNumFailedDownloads()).isEqualTo(1);
@@ -801,7 +845,8 @@ public class RemoteCacheTests {
                     remotePathResolver,
                     result,
                     new FileOutErr(stdout, stderr),
-                    outputFilesLocker));
+                    outputFilesLocker,
+                    progressStatusListener));
 
     assertThat(e.getSuppressed()).hasLength(2);
     assertThat(e.getSuppressed()[0]).isInstanceOf(IOException.class);
@@ -837,7 +882,8 @@ public class RemoteCacheTests {
                     remotePathResolver,
                     result,
                     new FileOutErr(stdout, stderr),
-                    outputFilesLocker));
+                    outputFilesLocker,
+                    progressStatusListener));
 
     for (Throwable t : downloadException.getSuppressed()) {
       assertThat(t).isInstanceOf(IOException.class);
@@ -873,7 +919,8 @@ public class RemoteCacheTests {
                     remotePathResolver,
                     result,
                     new FileOutErr(stdout, stderr),
-                    outputFilesLocker));
+                    outputFilesLocker,
+                    progressStatusListener));
 
     assertThat(e.getSuppressed()).isEmpty();
     assertThat(Throwables.getRootCause(e)).hasMessageThat().isEqualTo("reused interruption");
@@ -902,7 +949,8 @@ public class RemoteCacheTests {
             .setStderrDigest(digestStderr)
             .build();
 
-    cache.download(context, remotePathResolver, result, spyOutErr, outputFilesLocker);
+    cache.download(
+        context, remotePathResolver, result, spyOutErr, outputFilesLocker, progressStatusListener);
 
     verify(spyOutErr, Mockito.times(2)).childOutErr();
     verify(spyChildOutErr).clearOut();
@@ -945,7 +993,14 @@ public class RemoteCacheTests {
             .build();
     assertThrows(
         BulkTransferException.class,
-        () -> cache.download(context, remotePathResolver, result, spyOutErr, outputFilesLocker));
+        () ->
+            cache.download(
+                context,
+                remotePathResolver,
+                result,
+                spyOutErr,
+                outputFilesLocker,
+                progressStatusListener));
     verify(spyOutErr, Mockito.times(2)).childOutErr();
     verify(spyChildOutErr).clearOut();
     verify(spyChildOutErr).clearErr();
@@ -982,7 +1037,13 @@ public class RemoteCacheTests {
 
     // act
 
-    remoteCache.download(context, remotePathResolver, r, new FileOutErr(), outputFilesLocker);
+    remoteCache.download(
+        context,
+        remotePathResolver,
+        r,
+        new FileOutErr(),
+        outputFilesLocker,
+        progressStatusListener);
 
     // assert
 
@@ -1305,6 +1366,27 @@ public class RemoteCacheTests {
   }
 
   @Test
+  public void downloadOutErr_empty_doNotPerformDownload() throws Exception {
+    // Test that downloading empty stdout/stderr does not try to perform a download.
+
+    InMemoryRemoteCache remoteCache = newRemoteCache();
+    Digest emptyDigest = digestUtil.compute(new byte[0]);
+    ActionResult.Builder result = ActionResult.newBuilder();
+    result.setStdoutDigest(emptyDigest);
+    result.setStderrDigest(emptyDigest);
+
+    RemoteCache.waitForBulkTransfer(
+        remoteCache.downloadOutErr(
+            context,
+            result.build(),
+            new FileOutErr(execRoot.getRelative("stdout"), execRoot.getRelative("stderr"))),
+        true);
+
+    assertThat(remoteCache.getNumSuccessfulDownloads()).isEqualTo(0);
+    assertThat(remoteCache.getNumFailedDownloads()).isEqualTo(0);
+  }
+
+  @Test
   public void testDownloadFileWithSymlinkTemplate() throws Exception {
     // Test that when a symlink template is provided, we don't actually download files to disk.
     // Instead, a symbolic link should be created that points to a location where the file may
@@ -1365,7 +1447,12 @@ public class RemoteCacheTests {
     // act
     RemoteCache remoteCache = newRemoteCache(cas);
     remoteCache.download(
-        context, remotePathResolver, result.build(), null, /* outputFilesLocker= */ () -> {});
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
 
     // assert
     assertThat(digestUtil.compute(execRoot.getRelative("a/foo"))).isEqualTo(fooDigest);
@@ -1390,7 +1477,12 @@ public class RemoteCacheTests {
     // act
     RemoteCache remoteCache = newRemoteCache(map);
     remoteCache.download(
-        context, remotePathResolver, result.build(), null, /* outputFilesLocker= */ () -> {});
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
 
     // assert
     assertThat(execRoot.getRelative("a/bar").isDirectory()).isTrue();
@@ -1435,7 +1527,12 @@ public class RemoteCacheTests {
     // act
     RemoteCache remoteCache = newRemoteCache(map);
     remoteCache.download(
-        context, remotePathResolver, result.build(), null, /* outputFilesLocker= */ () -> {});
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
 
     // assert
     assertThat(digestUtil.compute(execRoot.getRelative("a/foo"))).isEqualTo(fooDigest);
@@ -1486,7 +1583,12 @@ public class RemoteCacheTests {
     // act
     RemoteCache remoteCache = newRemoteCache(map);
     remoteCache.download(
-        context, remotePathResolver, result.build(), null, /* outputFilesLocker= */ () -> {});
+        context,
+        remotePathResolver,
+        result.build(),
+        null,
+        outputFilesLocker,
+        progressStatusListener);
 
     // assert
     assertThat(digestUtil.compute(execRoot.getRelative("a/bar/foo/file"))).isEqualTo(fileDigest);
@@ -1545,6 +1647,50 @@ public class RemoteCacheTests {
     ImmutableList<Digest> toQuery =
         ImmutableList.of(fooDigest, quxDigest, barDigest, cmdDigest, actionDigest);
     assertThat(remoteCache.findMissingDigests(context, toQuery)).isEmpty();
+  }
+
+  @Test
+  public void upload_emptyBlobAndFile_doNotPerformUpload() throws Exception {
+    // Test that uploading an empty BLOB/file does not try to perform an upload.
+    InMemoryRemoteCache remoteCache = newRemoteCache();
+    Digest emptyDigest = fakeFileCache.createScratchInput(ActionInputHelper.fromPath("file"), "");
+    Path file = execRoot.getRelative("file");
+
+    Utils.getFromFuture(remoteCache.uploadBlob(context, emptyDigest, ByteString.EMPTY));
+    assertThat(remoteCache.findMissingDigests(context, ImmutableSet.of(emptyDigest)))
+        .containsExactly(emptyDigest);
+
+    Utils.getFromFuture(remoteCache.uploadFile(context, emptyDigest, file));
+    assertThat(remoteCache.findMissingDigests(context, ImmutableSet.of(emptyDigest)))
+        .containsExactly(emptyDigest);
+  }
+
+  @Test
+  public void upload_emptyOutputs_doNotPerformUpload() throws Exception {
+    // Test that uploading an empty output does not try to perform an upload.
+
+    // arrange
+    Digest emptyDigest =
+        fakeFileCache.createScratchInput(ActionInputHelper.fromPath("bar/test/wobble"), "");
+    Path file = execRoot.getRelative("bar/test/wobble");
+    InMemoryRemoteCache remoteCache = newRemoteCache();
+    Action action = Action.getDefaultInstance();
+    ActionKey actionDigest = digestUtil.computeActionKey(action);
+    Command cmd = Command.getDefaultInstance();
+
+    // act
+    remoteCache.upload(
+        context,
+        remotePathResolver,
+        actionDigest,
+        action,
+        cmd,
+        ImmutableList.of(file),
+        new FileOutErr(execRoot.getRelative("stdout"), execRoot.getRelative("stderr")));
+
+    // assert
+    assertThat(remoteCache.findMissingDigests(context, ImmutableSet.of(emptyDigest)))
+        .containsExactly(emptyDigest);
   }
 
   @Test

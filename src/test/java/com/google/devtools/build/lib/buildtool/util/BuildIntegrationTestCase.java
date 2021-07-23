@@ -49,6 +49,10 @@ import com.google.devtools.build.lib.analysis.starlark.StarlarkTransition.Transi
 import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.analysis.util.AnalysisTestUtil;
 import com.google.devtools.build.lib.analysis.util.AnalysisTestUtil.DummyWorkspaceStatusActionContext;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidNdkRepositoryFunction;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidNdkRepositoryRule;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidSdkRepositoryFunction;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidSdkRepositoryRule;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.bugreport.BugReporter;
 import com.google.devtools.build.lib.bugreport.Crash;
@@ -73,7 +77,10 @@ import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.NoSuchTargetException;
 import com.google.devtools.build.lib.packages.util.MockToolsConfig;
 import com.google.devtools.build.lib.pkgcache.PackageManager;
+import com.google.devtools.build.lib.rules.repository.LocalRepositoryFunction;
+import com.google.devtools.build.lib.rules.repository.LocalRepositoryRule;
 import com.google.devtools.build.lib.rules.repository.RepositoryDelegatorFunction;
+import com.google.devtools.build.lib.rules.repository.RepositoryFunction;
 import com.google.devtools.build.lib.runtime.BlazeModule;
 import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.runtime.BlazeServerStartupOptions;
@@ -86,17 +93,18 @@ import com.google.devtools.build.lib.server.FailureDetails.Spawn.Code;
 import com.google.devtools.build.lib.shell.AbnormalTerminationException;
 import com.google.devtools.build.lib.shell.Command;
 import com.google.devtools.build.lib.shell.CommandException;
+import com.google.devtools.build.lib.skyframe.BazelSkyframeExecutorConstants;
 import com.google.devtools.build.lib.skyframe.ConfiguredTargetAndData;
+import com.google.devtools.build.lib.skyframe.ManagedDirectoriesKnowledge;
 import com.google.devtools.build.lib.skyframe.PrecomputedValue;
 import com.google.devtools.build.lib.skyframe.PrecomputedValue.Injected;
+import com.google.devtools.build.lib.skyframe.SkyFunctions;
 import com.google.devtools.build.lib.skyframe.SkyframeExecutor;
 import com.google.devtools.build.lib.skyframe.util.SkyframeExecutorTestUtils;
 import com.google.devtools.build.lib.standalone.StandaloneModule;
-import com.google.devtools.build.lib.testutil.Suite;
 import com.google.devtools.build.lib.testutil.TestConstants;
 import com.google.devtools.build.lib.testutil.TestConstants.InternalTestExecutionMode;
 import com.google.devtools.build.lib.testutil.TestFileOutErr;
-import com.google.devtools.build.lib.testutil.TestSpec;
 import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.util.CommandBuilder;
 import com.google.devtools.build.lib.util.CommandUtils;
@@ -119,6 +127,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.concurrent.GuardedBy;
 import org.junit.After;
 import org.junit.Before;
@@ -129,7 +138,6 @@ import org.junit.Before;
  *
  * <p>All integration tests are at least size medium.
  */
-@TestSpec(size = Suite.MEDIUM_TESTS)
 public abstract class BuildIntegrationTestCase {
 
   /** Thrown when an integration test case fails. */
@@ -178,12 +186,14 @@ public abstract class BuildIntegrationTestCase {
     events.setFailFast(false);
     // TODO(mschaller): This will ignore any attempt by Blaze modules to provide a filesystem;
     // consider something better.
-    this.fileSystem = createFileSystem();
+    FileSystem nativeFileSystem = createFileSystem();
+    this.fileSystem = createFileSystemForBuildArtifacts(nativeFileSystem);
     this.testRoot = createTestRoot(fileSystem);
 
-    outputBase = testRoot.getRelative(outputBaseName);
+    outputBase = fileSystem.getPath(testRoot.getRelative(outputBaseName).asFragment());
     outputBase.createDirectoryAndParents();
-    workspace = testRoot.getRelative(getDesiredWorkspaceRelative());
+    workspace =
+        nativeFileSystem.getPath(testRoot.getRelative(getDesiredWorkspaceRelative()).asFragment());
     beforeCreatingWorkspace(workspace);
     workspace.createDirectoryAndParents();
     serverDirectories = createServerDirectories();
@@ -268,6 +278,7 @@ public abstract class BuildIntegrationTestCase {
     }
     LoggingUtil.installRemoteLoggerForTesting(null);
     testRoot.deleteTreesBelow(); // (comment out during debugging)
+    Thread.interrupted(); // If there was a crash in test case, main thread was interrupted.
   }
 
   /**
@@ -319,6 +330,10 @@ public abstract class BuildIntegrationTestCase {
 
   protected FileSystem createFileSystem() throws Exception {
     return FileSystems.getNativeFileSystem(getDigestHashFunction());
+  }
+
+  protected FileSystem createFileSystemForBuildArtifacts(FileSystem fileSystem) {
+    return fileSystem;
   }
 
   protected DigestHashFunction getDigestHashFunction() {
@@ -377,13 +392,34 @@ public abstract class BuildIntegrationTestCase {
     return TestStrategyModule.getModule();
   }
 
-  private static BlazeModule getNoResolvedFileModule() {
+  private static BlazeModule getMockBazelRepositoryModule() {
     return new BlazeModule() {
+      @Override
+      public void workspaceInit(
+          BlazeRuntime runtime, BlazeDirectories directories, WorkspaceBuilder builder) {
+        ImmutableMap.Builder<String, RepositoryFunction> repositoryHandlers =
+            new ImmutableMap.Builder<String, RepositoryFunction>()
+                .put(LocalRepositoryRule.NAME, new LocalRepositoryFunction())
+                .put(AndroidSdkRepositoryRule.NAME, new AndroidSdkRepositoryFunction())
+                .put(AndroidNdkRepositoryRule.NAME, new AndroidNdkRepositoryFunction());
+        builder.addSkyFunction(
+            SkyFunctions.REPOSITORY_DIRECTORY,
+            new RepositoryDelegatorFunction(
+                repositoryHandlers.build(),
+                null,
+                new AtomicBoolean(true),
+                ImmutableMap::of,
+                directories,
+                ManagedDirectoriesKnowledge.NO_MANAGED_DIRECTORIES,
+                BazelSkyframeExecutorConstants.EXTERNAL_PACKAGE_HELPER));
+      }
+
       @Override
       public ImmutableList<Injected> getPrecomputedValues() {
         return ImmutableList.of(
             PrecomputedValue.injected(
-                RepositoryDelegatorFunction.RESOLVED_FILE_INSTEAD_OF_WORKSPACE, Optional.empty()));
+                RepositoryDelegatorFunction.RESOLVED_FILE_INSTEAD_OF_WORKSPACE, Optional.empty()),
+            PrecomputedValue.injected(RepositoryDelegatorFunction.ENABLE_BZLMOD, false));
       }
     };
   }
@@ -411,7 +447,7 @@ public abstract class BuildIntegrationTestCase {
         .setBugReporter(bugReporter)
         .setStartupOptionsProvider(startupOptionsParser)
         .addBlazeModule(connectivityModule)
-        .addBlazeModule(getNoResolvedFileModule())
+        .addBlazeModule(getMockBazelRepositoryModule())
         .addBlazeModule(getSpawnModule())
         .addBlazeModule(new IncludeScanningModule())
         .addBlazeModule(getBuildInfoModule())
@@ -659,7 +695,7 @@ public abstract class BuildIntegrationTestCase {
       String... arguments)
       throws ExecException, InterruptedException {
     if (workingDirectory == null) {
-      workingDirectory = directories.getWorkspace();
+      workingDirectory = fileSystem.getPath(directories.getWorkspace().asFragment());
     }
     List<String> argv = Lists.newArrayList(arguments);
     argv.add(0, executable.toString());
@@ -859,7 +895,7 @@ public abstract class BuildIntegrationTestCase {
   }
 
   /** {@link BugReporter} that stores bug reports for later inspection. */
-  protected static final class RecordingBugReporter implements BugReporter {
+  protected static class RecordingBugReporter implements BugReporter {
     @GuardedBy("this")
     private final List<Throwable> exceptions = new ArrayList<>();
 

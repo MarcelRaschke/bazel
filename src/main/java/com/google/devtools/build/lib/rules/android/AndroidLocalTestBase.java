@@ -461,7 +461,8 @@ public abstract class AndroidLocalTestBase implements RuleConfiguredTargetFactor
       builder.addArtifact(androidAllJarsPropertiesFile);
     }
 
-    builder.addArtifacts(getRuntimeJarsForTargets(getAndCheckTestSupport(ruleContext)));
+    // runtime jars always in naive link order, incompatible with compile order runfiles.
+    builder.addArtifacts(getRuntimeJarsForTargets(getAndCheckTestSupport(ruleContext)).toList());
 
     builder.addTargets(depsForRunfiles, RunfilesProvider.DEFAULT_RUNFILES);
 
@@ -605,8 +606,7 @@ public abstract class AndroidLocalTestBase implements RuleConfiguredTargetFactor
             javaSemantics,
             javaCommon.getJavacOpts(),
             javaTargetAttributesBuilder,
-            additionalArtifacts,
-            /* disableStrictDeps= */ false);
+            additionalArtifacts);
 
     if (ruleContext.isAttrDefined("$junit", BuildType.LABEL)) {
       // JUnit jar must be ahead of android runtime jars since these contain stubbed definitions

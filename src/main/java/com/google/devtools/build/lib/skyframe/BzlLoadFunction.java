@@ -13,10 +13,10 @@
 // limitations under the License.
 package com.google.devtools.build.lib.skyframe;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
@@ -835,6 +835,9 @@ public class BzlLoadFunction implements SkyFunction {
                 .getRepositoryMapping()
                 .getOrDefault(enclosingFileLabel.getRepository(), ImmutableMap.of());
       }
+    } else if (key instanceof BzlLoadValue.KeyForBzlmod) {
+      // TODO(pcloudy): Implement repo mapping for bzlmod repos
+      return ImmutableMap.of();
     } else {
       // We are fully done with workspace evaluation so we should get the mappings from the
       // final RepositoryMappingValue
@@ -1041,6 +1044,8 @@ public class BzlLoadFunction implements SkyFunction {
       return builtins.predeclaredForBuildBzl;
     } else if (key instanceof BzlLoadValue.KeyForWorkspace) {
       return starlarkEnv.getWorkspaceBzlEnv();
+    } else if (key instanceof BzlLoadValue.KeyForBzlmod) {
+      return starlarkEnv.getBzlmodBzlEnv();
     } else if (key instanceof BzlLoadValue.KeyForBuiltins) {
       return starlarkEnv.getBuiltinsBzlEnv();
     } else {
@@ -1204,8 +1209,8 @@ public class BzlLoadFunction implements SkyFunction {
       Preconditions.checkState(
           cacheSize >= 0, "Expected positive Starlark cache size if caching. %s", cacheSize);
       cache =
-          CacheBuilder.newBuilder()
-              .concurrencyLevel(BlazeInterners.concurrencyLevel())
+          Caffeine.newBuilder()
+              .initialCapacity(BlazeInterners.concurrencyLevel())
               .maximumSize(cacheSize)
               .recordStats()
               .build();

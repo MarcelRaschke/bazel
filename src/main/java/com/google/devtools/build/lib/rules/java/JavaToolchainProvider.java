@@ -15,31 +15,40 @@ package com.google.devtools.build.lib.rules.java;
 
 import static com.google.common.base.StandardSystemProperty.JAVA_SPECIFICATION_VERSION;
 
+import com.google.auto.value.AutoValue;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.analysis.FilesToRunProvider;
+import com.google.devtools.build.lib.analysis.PackageSpecificationProvider;
 import com.google.devtools.build.lib.analysis.ProviderCollection;
 import com.google.devtools.build.lib.analysis.RuleContext;
 import com.google.devtools.build.lib.analysis.RuleErrorConsumer;
 import com.google.devtools.build.lib.analysis.TransitiveInfoCollection;
 import com.google.devtools.build.lib.analysis.platform.ToolchainInfo;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.collect.nestedset.Depset;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
+import com.google.devtools.build.lib.packages.BazelModuleContext;
 import com.google.devtools.build.lib.packages.BuiltinProvider;
 import com.google.devtools.build.lib.packages.NativeInfo;
+import com.google.devtools.build.lib.packages.PackageSpecification.PackageGroupContents;
 import com.google.devtools.build.lib.packages.Provider;
+import com.google.devtools.build.lib.rules.java.JavaPluginInfo.JavaPluginData;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec.VisibleForSerialization;
 import com.google.devtools.build.lib.starlarkbuildapi.java.JavaToolchainStarlarkApiProviderApi;
 import java.util.Iterator;
 import javax.annotation.Nullable;
 import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.Module;
 import net.starlark.java.eval.Sequence;
+import net.starlark.java.eval.Starlark;
 import net.starlark.java.eval.StarlarkList;
+import net.starlark.java.eval.StarlarkThread;
 
 /** Information about the JDK used by the <code>java_*</code> rules. */
 @Immutable
@@ -96,6 +105,7 @@ public class JavaToolchainProvider extends NativeInfo
       @Nullable JavaToolchainTool headerCompiler,
       @Nullable JavaToolchainTool headerCompilerDirect,
       @Nullable AndroidLintTool androidLint,
+      JspecifyInfo jspecifyInfo,
       ImmutableSet<String> headerCompilerBuiltinProcessors,
       ImmutableSet<String> reducedClasspathIncompatibleProcessors,
       boolean forciblyDisableHeaderCompilation,
@@ -120,6 +130,7 @@ public class JavaToolchainProvider extends NativeInfo
         headerCompiler,
         headerCompilerDirect,
         androidLint,
+        jspecifyInfo,
         headerCompilerBuiltinProcessors,
         reducedClasspathIncompatibleProcessors,
         forciblyDisableHeaderCompilation,
@@ -149,6 +160,7 @@ public class JavaToolchainProvider extends NativeInfo
   @Nullable private final JavaToolchainTool headerCompiler;
   @Nullable private final JavaToolchainTool headerCompilerDirect;
   @Nullable private final AndroidLintTool androidLint;
+  @Nullable private final JspecifyInfo jspecifyInfo;
   private final ImmutableSet<String> headerCompilerBuiltinProcessors;
   private final ImmutableSet<String> reducedClasspathIncompatibleProcessors;
   private final boolean forciblyDisableHeaderCompilation;
@@ -179,6 +191,7 @@ public class JavaToolchainProvider extends NativeInfo
       @Nullable JavaToolchainTool headerCompiler,
       @Nullable JavaToolchainTool headerCompilerDirect,
       @Nullable AndroidLintTool androidLint,
+      @Nullable JspecifyInfo jspecifyInfo,
       ImmutableSet<String> headerCompilerBuiltinProcessors,
       ImmutableSet<String> reducedClasspathIncompatibleProcessors,
       boolean forciblyDisableHeaderCompilation,
@@ -207,6 +220,7 @@ public class JavaToolchainProvider extends NativeInfo
     this.headerCompiler = headerCompiler;
     this.headerCompilerDirect = headerCompilerDirect;
     this.androidLint = androidLint;
+    this.jspecifyInfo = jspecifyInfo;
     this.headerCompilerBuiltinProcessors = headerCompilerBuiltinProcessors;
     this.reducedClasspathIncompatibleProcessors = reducedClasspathIncompatibleProcessors;
     this.forciblyDisableHeaderCompilation = forciblyDisableHeaderCompilation;
@@ -269,6 +283,11 @@ public class JavaToolchainProvider extends NativeInfo
     return androidLint;
   }
 
+  @Nullable
+  public JspecifyInfo jspecifyInfo() {
+    return jspecifyInfo;
+  }
+
   /** Returns class names of annotation processors that are built in to the header compiler. */
   public ImmutableSet<String> getHeaderCompilerBuiltinProcessors() {
     return headerCompilerBuiltinProcessors;
@@ -297,6 +316,7 @@ public class JavaToolchainProvider extends NativeInfo
    * Return the {@link Artifact} of the binary that enforces one-version compliance of java
    * binaries.
    */
+  @Override
   @Nullable
   public Artifact getOneVersionBinary() {
     return oneVersion;
@@ -304,6 +324,7 @@ public class JavaToolchainProvider extends NativeInfo
 
   /** Return the {@link Artifact} of the allowlist used by the one-version compliance checker. */
   @Nullable
+  @Override
   public Artifact getOneVersionAllowlist() {
     return oneVersionAllowlist;
   }
@@ -392,8 +413,22 @@ public class JavaToolchainProvider extends NativeInfo
     return javaSemantics;
   }
 
+  @Override
   public JavaRuntimeInfo getJavaRuntime() {
     return javaRuntime;
+  }
+
+  @Override
+  @Nullable
+  public AndroidLintTool stalarkAndroidLinter(StarlarkThread thread) throws EvalException {
+    RepositoryName repository =
+        BazelModuleContext.of(Module.ofInnermostEnclosingStarlarkFunction(thread))
+            .label()
+            .getRepository();
+    if (!"@_builtins".equals(repository.getName())) {
+      throw Starlark.errorf("private API only for use in builtins");
+    }
+    return getAndroidLint();
   }
 
   /** Returns the input Java language level */
@@ -440,5 +475,37 @@ public class JavaToolchainProvider extends NativeInfo
   @Override
   public Provider getProvider() {
     return PROVIDER;
+  }
+
+  @AutoValue
+  abstract static class JspecifyInfo {
+
+    abstract JavaPluginData jspecifyProcessor();
+
+    abstract NestedSet<Artifact> jspecifyImplicitDeps();
+
+    abstract ImmutableList<String> jspecifyJavacopts();
+
+    abstract ImmutableList<PackageSpecificationProvider> jspecifyPackages();
+
+    boolean matches(Label label) {
+      for (PackageSpecificationProvider provider : jspecifyPackages()) {
+        for (PackageGroupContents specifications : provider.getPackageSpecifications().toList()) {
+          if (specifications.containsPackage(label.getPackageIdentifier())) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    static JspecifyInfo create(
+        JavaPluginData jspecifyProcessor,
+        NestedSet<Artifact> jspecifyImplicitDeps,
+        ImmutableList<String> jspecifyJavacopts,
+        ImmutableList<PackageSpecificationProvider> jspecifyPackages) {
+      return new AutoValue_JavaToolchainProvider_JspecifyInfo(
+          jspecifyProcessor, jspecifyImplicitDeps, jspecifyJavacopts, jspecifyPackages);
+    }
   }
 }
